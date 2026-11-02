@@ -2,15 +2,29 @@
 
 The default branch maintains our performance and updater patches on top of the tag in
 `base-tag`. Every six hours Actions can select the newest upstream stable release,
-apply this patch stack, build and test an x86_64 Linux musl package, and publish it.
+apply this patch stack, build and test four native Unix packages, and publish them together.
 Patch conflicts, dependency drift, test failures, or incomplete packages stop publication.
 The last good release remains available. Set the repository variable
 `PATCHED_RELEASES_ENABLED=true` to enable scheduled builds; manual dispatch works without it.
 
-Hosted builds use four Cargo jobs on GitHub's standard public Linux runner. The Rust cache
-retains compiled dependencies as well as downloaded sources, including after a failed build.
-Workspace crates are rebuilt when their code or release version changes. Each build command
-prints its elapsed time and adds a row to the Actions job summary.
+The four hosted jobs run concurrently:
+
+| Package target | Native runner | Cargo jobs |
+| --- | --- | ---: |
+| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | 4 |
+| `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | 4 |
+| `x86_64-apple-darwin` | `macos-15-intel` | 2 |
+| `aarch64-apple-darwin` | `macos-15` | 1 |
+
+The planning job freezes one source commit and lockfile in a Git bundle. Every platform
+restores that exact commit; the publisher verifies source IDs, package manifests, native
+installation results, and archive checksums before publishing. Any failed platform prevents
+a partial release. Windows is not built.
+
+Each platform caches compiled dependencies and downloaded sources, including after a failed
+build. Workspace crates are rebuilt when their code or release version changes. Compile,
+test, and packaging are separate Actions steps; individual commands also report elapsed
+times in the job summary. macOS uses fewer Cargo jobs to fit the hosted runners' memory.
 
 The recipe needs a user-owned fork, with this branch as its default branch. Enable only
 `downstream-release.yml`; the upstream release workflow expects OpenAI runners and secrets.
@@ -26,16 +40,32 @@ never falls back to an official package. Ordinary builds without this environmen
 variable keep the official channel.
 
 The release contains the client, the matching daemon-capable executable, code-mode host,
-bwrap and ripgrep resources, package checksums, source patch, build provenance, and a
-separate symbols archive containing `codex.debug`. Binaries retain frame pointers.
-Linux x86_64 is the only initial target; do not install this channel on other platforms.
-Native voice runtime packaging and signed macOS/Windows builds are outside this recipe.
+Linux bwrap and platform-specific ripgrep resources, package checksums, source patch, and
+build provenance. Each platform has a separate symbols archive for all three first-party
+executables. Linux uses `.debug` files; macOS uses matching `.dSYM` bundles. Binaries retain
+frame pointers. macOS executables are ad-hoc signed with upstream entitlements and checked
+for accidental Homebrew dynamic dependencies; they are not Developer ID notarized.
+Native voice runtime packaging is outside this recipe.
 
 For profiling, extract the symbols archive into a `.debug` directory beside the installed
 `bin/codex` and `bin/codex-code-mode-host`. The binaries contain GNU debug links to these
 matching `.debug` files, and retain their build IDs for tools such as perf and GDB.
+On macOS, retain the matching `.dSYM` bundles for LLDB/Instruments; packaging checks their
+UUIDs against the shipped executables.
 
 ## First cutover
+
+The same bootstrap command supports Linux/macOS on x86_64/ARM64, fresh or existing installs:
+
+```sh
+curl -fsSL https://gist.githubusercontent.com/ZHDI-1/9cc96c3eee777b855a3e82d2c73d6f46/raw/install-codex-patched.sh | bash
+```
+
+The Gist mirrors `bootstrap.sh` in this directory. Its OS/architecture detection, Rosetta
+handling, and SHA-256 fallbacks follow upstream's installer. It verifies the release
+installer and confirms the platform package exists before installing both managed roots.
+Stock macOS `shasum` works; GNU `sha256sum`, Python, `jq`, and GitHub login are not required.
+Pass `bash -s -- --no-restart` to defer the final daemon restart, or `--help` for usage.
 
 Do this after reviewing a successful release. Save the two current selection targets
 and their `auto-update-version` markers before changing anything. Close other Codex
@@ -78,6 +108,10 @@ rollback. The installer retains its previous selected package; release assets ar
 on GitHub. To return to upstream, use the official installer for both package roots and
 restart the daemon. Keep the saved old selections until the first cutover is verified.
 
-Actions runs scoped history/cache/reflow, install-context, daemon install/updater, and
+Both Linux architectures run scoped history/cache/reflow, daemon install/updater, and
+install-context regressions. macOS runs install-context tests and type-checks the TUI test
+suite without linking its large test binary. Every platform executes the packaged native
+binaries, verifies CLI and daemon installations in temporary homes, and checks its symbols.
+The planner also tests bootstrap behavior, source-bundle restoration, release assembly, and
 installer regressions. The private long-session tmux benchmark remains a local check;
 it is not uploaded to CI, and CI timings must not be compared to that benchmark.
