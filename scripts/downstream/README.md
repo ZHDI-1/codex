@@ -49,7 +49,7 @@ sh ./install.sh
 CODEX_INSTALL_DAEMON_ONLY=1 sh ./install.sh
 codex app-server daemon restart
 codex --version
-codex app-server daemon status
+codex app-server daemon version
 ```
 
 Both installations select `latest`, so subsequent client updates and daemon auto updates
