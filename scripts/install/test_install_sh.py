@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 
 INSTALL_SCRIPT = Path(__file__).with_name("install.sh")
@@ -21,6 +22,50 @@ MISMATCH_VERSION = "0.145.0"
 
 
 class InstallShTest(unittest.TestCase):
+    def test_downstream_latest_updates_both_package_roots_without_official_requests(self) -> None:
+        version = "0.166.0+patched.12"
+        repository = "example/patched-codex"
+        for daemon_only in (False, True):
+            with self.subTest(daemon_only=daemon_only), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                installer = root / "install.sh"
+                installer.write_text(INSTALL_SCRIPT.read_text().replace(
+                    'GITHUB_RELEASE_REPOSITORY="openai/codex"',
+                    f'GITHUB_RELEASE_REPOSITORY="{repository}"',
+                ))
+                archive, checksum, metadata = create_package_release(
+                    root, metadata_version=version, binary_version=version,
+                )
+                with patch(__name__ + ".INSTALL_SCRIPT", installer):
+                    result, requests = run_installer_in(
+                        root, "latest", metadata_json=metadata, archive_path=archive,
+                        checksum_path=checksum, force_macos=True, use_mirror=True,
+                        daemon_only=daemon_only,
+                    )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(requests), 3)
+                self.assertTrue(all(f"/{repository}/" in url for url in requests), requests)
+                package = "app-server-daemon" if daemon_only else "standalone"
+                selected = root / "codex-home/packages" / package
+                self.assertEqual((selected / "current").resolve().name,
+                                 f"{version}-aarch64-apple-darwin")
+                self.assertEqual((selected / "auto-update-version").read_text(),
+                                 f"{version}-aarch64-apple-darwin")
+
+    def test_downstream_metadata_failure_does_not_fall_back_to_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = root / "install.sh"
+            installer.write_text(INSTALL_SCRIPT.read_text().replace(
+                'GITHUB_RELEASE_REPOSITORY="openai/codex"',
+                'GITHUB_RELEASE_REPOSITORY="example/patched-codex"',
+            ))
+            with patch(__name__ + ".INSTALL_SCRIPT", installer):
+                result, requests = run_installer_in(root, "latest", metadata_failure=True,
+                                                    use_mirror=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(requests, ["https://api.github.com/repos/example/patched-codex/releases/latest"])
+
     def test_metadata_fetch_failure_is_not_reported_as_missing_assets(self) -> None:
         result, requests = run_installer(VERSION, metadata_failure=True)
 
@@ -1077,7 +1122,7 @@ def run_installer_in(
                   exit 22
                 fi
                 ;;
-              https://github.com/openai/codex/releases/download/*/codex-package_SHA256SUMS)
+              https://github.com/*/*/releases/download/*/codex-package_SHA256SUMS)
                 if [ "$CODEX_TEST_RELEASES_MODE" = "corrupt_checksum_and_github" ]; then
                   printf '<html>proxy error</html>\n' >"$output"
                   exit 0
@@ -1088,7 +1133,7 @@ def run_installer_in(
                   exit 22
                 fi
                 ;;
-              https://github.com/openai/codex/releases/download/*/codex-package-*.tar.gz)
+              https://github.com/*/*/releases/download/*/codex-package-*.tar.gz)
                 if [ -n "$CODEX_TEST_ARCHIVE_PATH" ]; then
                   cp "$CODEX_TEST_ARCHIVE_PATH" "$output"
                 else

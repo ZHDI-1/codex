@@ -1,0 +1,127 @@
+name: Patched Codex releases
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream stable tag (empty selects the latest stable release)"
+        type: string
+      force:
+        description: "Rebuild even if upstream and our patch stack have not changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: downstream-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.repository != 'openai/codex' &&
+      (github.event_name == 'workflow_dispatch' || vars.PATCHED_RELEASES_ENABLED == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    env:
+      CODEX_RELEASE_REPOSITORY: ${{ github.repository }}
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_DEBUG: "1"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      RUSTFLAGS: "-C force-frame-pointers=yes"
+      RUST_MIN_STACK: "33554432"
+      CARGO_BUILD_JOBS: "2"
+      AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Select upstream stable release
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+          FORCE: ${{ inputs.force }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_tag="${REQUESTED_TAG:-$(gh api repos/openai/codex/releases/latest --jq .tag_name)}"
+          [[ "$upstream_tag" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          changed=true
+          if [[ "$FORCE" != true && -z "$REQUESTED_TAG" ]]; then
+            latest_body="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null || true)"
+            if [[ "$latest_body" == *"Upstream: $upstream_tag"* && "$latest_body" == *"Maintenance: $GITHUB_SHA"* ]]; then
+              changed=false
+            fi
+          fi
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+      - name: Apply patch stack and configure our channel
+        if: steps.select.outputs.changed == 'true'
+        id: prepare
+        env:
+          UPSTREAM_TAG: ${{ steps.select.outputs.upstream_tag }}
+        run: |
+          python3 scripts/downstream/prepare.py "$GITHUB_WORKSPACE" "$RUNNER_TEMP/candidate" \
+            "$UPSTREAM_TAG" "$GITHUB_REPOSITORY" "$GITHUB_RUN_NUMBER"
+      - name: Install native build dependencies
+        if: steps.select.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils build-essential pkg-config libcap-dev libssl-dev cmake clang libclang-dev
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # pinned action
+        if: steps.select.outputs.changed == 'true'
+        with:
+          toolchain: ${{ steps.prepare.outputs.toolchain }}
+          targets: x86_64-unknown-linux-musl
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: steps.select.outputs.changed == 'true'
+        with:
+          version: 0.14.0
+      - name: Configure musl dependencies
+        if: steps.select.outputs.changed == 'true'
+        env:
+          TARGET: x86_64-unknown-linux-musl
+          CANDIDATE: ${{ steps.prepare.outputs.candidate }}
+        run: bash "$CANDIDATE/.github/scripts/install-musl-build-tools.sh"
+      - name: Build, test, and prepare release assets
+        if: steps.select.outputs.changed == 'true'
+        env:
+          CANDIDATE: ${{ steps.prepare.outputs.candidate }}
+        run: python3 scripts/downstream/build.py "$CANDIDATE" "$RUNNER_TEMP/dist"
+      - name: Publish complete release
+        if: steps.select.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ steps.prepare.outputs.candidate }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.tag }}
+          UPSTREAM_TAG: ${{ steps.select.outputs.upstream_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git -C "$CANDIDATE" tag "$RELEASE_TAG"
+          git -C "$CANDIDATE" push "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$RELEASE_TAG"
+          notes="$RUNNER_TEMP/release-notes.txt"
+          cat > "$notes" <<EOF
+          Patched Codex: history rendering performance fixes, up to 24 workers.
+
+          Upstream: $UPSTREAM_TAG
+          Maintenance: $GITHUB_SHA
+
+          Linux x86_64 musl. Includes matching client/daemon, helper resources,
+          checksums, provenance, source patch, and separate debug symbols.
+          See scripts/downstream/README.md for installation and rollback.
+          EOF
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/dist/"* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "Codex ${RELEASE_TAG#rust-v}" --notes-file "$notes"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
