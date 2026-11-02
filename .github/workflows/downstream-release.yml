@@ -36,7 +36,7 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       RUSTFLAGS: "-C force-frame-pointers=yes"
       RUST_MIN_STACK: "33554432"
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
       AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
@@ -108,6 +108,15 @@ jobs:
           TARGET: x86_64-unknown-linux-musl
           CANDIDATE: ${{ steps.prepare.outputs.candidate }}
         run: bash "$CANDIDATE/.github/scripts/install-musl-build-tools.sh"
+      - name: Restore compiled Rust dependencies
+        if: steps.select.outputs.changed == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: ${{ steps.prepare.outputs.candidate }}/codex-rs -> target
+          prefix-key: patched-codex-musl-v1
+          cache-bin: false
+          cache-on-failure: true
+          cache-directories: /tmp/codex-package
       - name: Build, test, and prepare release assets
         if: steps.select.outputs.changed == 'true'
         env:

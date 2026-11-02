@@ -2,14 +2,17 @@
 """Build and validate a prepared Linux package. This script does not publish or install it."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 from prepare import external_lock
@@ -30,10 +33,32 @@ def build(root: Path, dist: Path) -> None:
     sys.path.insert(0, str(root / "scripts"))
     from codex_package.targets import TARGET_SPECS
     from codex_package.v8 import resolve_codex_v8_cargo_env
-    os.environ.update(resolve_codex_v8_cargo_env(TARGET_SPECS[TARGET]))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as stream:
+            stream.write("\n| Command | Elapsed seconds |\n| --- | ---: |\n")
+
+    @contextmanager
+    def timed(command):
+        started = time.monotonic()
+        print(f"Starting: {command}", flush=True)
+        try:
+            yield
+        finally:
+            elapsed = time.monotonic() - started
+            print(f"Elapsed {elapsed:.1f}s: {command}", flush=True)
+            if summary:
+                # Keep shell punctuation from changing the summary's table layout.
+                escaped = command.replace("|", "&#124;").replace("`", "&#96;")
+                with open(summary, "a") as stream:
+                    stream.write(f"| `{escaped}` | {elapsed:.1f} |\n")
 
     def run(*args: str, cwd=rust, **kwargs):
-        return subprocess.run(args, cwd=cwd, check=True, text=True, **kwargs)
+        with timed(shlex.join(args)):
+            return subprocess.run(args, cwd=cwd, check=True, text=True, **kwargs)
+
+    with timed("Resolve and verify V8 artifacts"):
+        os.environ.update(resolve_codex_v8_cargo_env(TARGET_SPECS[TARGET]))
 
     # Cargo release tags can retain 0.0.0 workspace entries in their lockfile.
     # Normalize only workspace versions and refuse any external dependency drift.
@@ -77,9 +102,10 @@ def build(root: Path, dist: Path) -> None:
         run("strip", "--strip-unneeded", str(binary))
         run("objcopy", f"--add-gnu-debuglink={symbols}", str(binary))
     for folder, name in [(stage, f"codex-package-{TARGET}.tar.gz"), (debug, f"codex-symbols-{TARGET}.tar.gz")]:
-        with tarfile.open(dist / name, "w:gz") as archive:
-            for path in sorted(folder.iterdir()):
-                archive.add(path, arcname=path.name)
+        with timed(f"Archive {name}"):
+            with tarfile.open(dist / name, "w:gz") as archive:
+                for path in sorted(folder.iterdir()):
+                    archive.add(path, arcname=path.name)
     package_name = f"codex-package-{TARGET}.tar.gz"
     digest = hashlib.sha256((dist / package_name).read_bytes()).hexdigest()
     (dist / "codex-package_SHA256SUMS").write_text(f"{digest}  {package_name}\n")

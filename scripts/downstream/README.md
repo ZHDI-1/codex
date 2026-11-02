@@ -7,6 +7,11 @@ Patch conflicts, dependency drift, test failures, or incomplete packages stop pu
 The last good release remains available. Set the repository variable
 `PATCHED_RELEASES_ENABLED=true` to enable scheduled builds; manual dispatch works without it.
 
+Hosted builds use four Cargo jobs on GitHub's standard public Linux runner. The Rust cache
+retains compiled dependencies as well as downloaded sources, including after a failed build.
+Workspace crates are rebuilt when their code or release version changes. Each build command
+prints its elapsed time and adds a row to the Actions job summary.
+
 The recipe needs a user-owned fork, with this branch as its default branch. Enable only
 `downstream-release.yml`; the upstream release workflow expects OpenAI runners and secrets.
 No PAT is needed: the workflow uses its repository's `GITHUB_TOKEN`. Run numbers are
