@@ -24,7 +24,9 @@ a partial release. Windows is not built.
 Each platform caches compiled dependencies and downloaded sources, including after a failed
 build. Workspace crates are rebuilt when their code or release version changes. Compile,
 test, and packaging are separate Actions steps; individual commands also report elapsed
-times in the job summary. macOS uses fewer Cargo jobs to fit the hosted runners' memory.
+times in the job summary. macOS type-checks the TUI tests before the long executable build,
+and uses fewer Cargo jobs to fit the hosted runners' memory. Verified V8 downloads use
+the same stable cache directory on every runner.
 
 The recipe needs a user-owned fork, with this branch as its default branch. Enable only
 `downstream-release.yml`; the upstream release workflow expects OpenAI runners and secrets.

@@ -72,13 +72,19 @@ def build(root, dist, target, phase):
     from codex_package.targets import TARGET_SPECS
     from codex_package.v8 import resolve_codex_v8_cargo_env
     with timed("Resolve and verify V8 artifacts"):
-        os.environ.update(resolve_codex_v8_cargo_env(TARGET_SPECS[target]))
+        os.environ.update(resolve_codex_v8_cargo_env(
+            TARGET_SPECS[target], cache_root=Path("/tmp/codex-package")))
     output = Path(os.environ.get("CARGO_TARGET_DIR", rust / "target"))
     if not output.is_absolute():
         output = rust / output
     output = output / target / "release"
     linux = target.endswith("linux-musl")
     stage = dist.parent / "package"
+
+    if phase in ("all", "check") and not linux:
+        # Check before code generation so compiler failures do not waste a full build.
+        run("cargo", "check", "--locked", "--release", "--target", target,
+            "-p", "codex-tui", "--tests", cwd=rust)
 
     if phase in ("all", "compile"):
         command = ["cargo", "build", "--locked", "--release", "--target", target]
@@ -90,7 +96,7 @@ def build(root, dist, target, phase):
         test = ["cargo", "test", "--locked", "--release", "--target", target]
         run(*test, "-p", "codex-install-context", "--lib", cwd=rust)
         # Keep the large transcript test binary on the 16 GiB Linux runners.
-        # Macs type-check that suite and run native install/signature checks below.
+        # Macs type-check that suite first and run native install/signature checks below.
         if linux:
             run(*test, "-p", "codex-app-server-daemon", "--lib", "--",
                 "managed_install", "prepare_install", "update_loop", cwd=rust)
@@ -98,9 +104,6 @@ def build(root, dist, target, phase):
                 "app_server_session::history::tests", "history_render::tests",
                 "render::highlight_cache::tests", "resize_reflow", "insert_history",
                 "update_versions", "update_action", "updates_cache", cwd=rust)
-        else:
-            run("cargo", "check", "--locked", "--release", "--target", target,
-                "-p", "codex-tui", "--tests", cwd=rust)
 
     if phase in ("all", "package"):
         dist.mkdir(parents=True, exist_ok=False)
@@ -183,6 +186,6 @@ if __name__ == "__main__":
     parser.add_argument("candidate", type=Path)
     parser.add_argument("dist", type=Path)
     parser.add_argument("--target", choices=TARGETS, required=True)
-    parser.add_argument("--phase", choices=("all", "compile", "test", "package"), default="all")
+    parser.add_argument("--phase", choices=("all", "check", "compile", "test", "package"), default="all")
     args = parser.parse_args()
     build(args.candidate.resolve(), args.dist.resolve(), args.target, args.phase)

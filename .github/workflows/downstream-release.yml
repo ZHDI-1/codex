@@ -177,9 +177,11 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install pkg-config openssl@3
-          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
-          echo "OPENSSL_NO_VENDOR=1" >> "$GITHUB_ENV"
+          {
+            echo "OPENSSL_DIR=$(brew --prefix openssl@3)"
+            echo "OPENSSL_STATIC=1"
+            echo "OPENSSL_NO_VENDOR=1"
+          } >> "$GITHUB_ENV"
           python3 --version
           xcrun --find dsymutil
       - name: Restore compiled dependencies
@@ -190,6 +192,9 @@ jobs:
           cache-bin: false
           cache-on-failure: true
           cache-directories: /tmp/codex-package
+      - name: Check macOS test compilation before the full build
+        if: runner.os == 'macOS'
+        run: python3 scripts/downstream/build.py "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/dist" --target "$TARGET" --phase check
       - name: Compile release executables
         run: python3 scripts/downstream/build.py "$RUNNER_TEMP/candidate" "$RUNNER_TEMP/dist" --target "$TARGET" --phase compile
       - name: Run native regression tests
