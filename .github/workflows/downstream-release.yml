@@ -75,8 +75,19 @@ jobs:
       - name: Install native build dependencies
         if: steps.select.outputs.changed == 'true'
         run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc /usr/share/swift
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends binutils build-essential pkg-config libcap-dev libssl-dev cmake clang libclang-dev
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        if: steps.select.outputs.changed == 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/codex-package
+          key: codex-downloads-${{ runner.os }}-${{ steps.prepare.outputs.toolchain }}-${{ steps.select.outputs.upstream_tag }}
+          restore-keys: |
+            codex-downloads-${{ runner.os }}-${{ steps.prepare.outputs.toolchain }}-
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # pinned action
         if: steps.select.outputs.changed == 'true'
         with:
