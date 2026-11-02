@@ -6442,6 +6442,7 @@ async fn make_test_app() -> Box<App> {
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
         transcript_reflow: TranscriptReflowState::default(),
+        background_reflow: Default::default(),
         initial_history_replay_buffer: None,
         pending_thread_switch_resets: 0,
         scrollback_has_older_history: false,
@@ -6568,6 +6569,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
             transcript_reflow: TranscriptReflowState::default(),
+            background_reflow: Default::default(),
             initial_history_replay_buffer: None,
             pending_thread_switch_resets: 0,
             scrollback_has_older_history: false,
@@ -7465,13 +7467,17 @@ async fn thread_switch_replay_buffer_uses_transcript_tail_mode_when_row_cap_pres
 }
 
 #[tokio::test]
-async fn thread_switch_replay_buffer_is_disabled_without_row_cap() {
+async fn thread_switch_replay_defers_formatting_without_row_cap() {
     let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
     app.local_settings.tui.terminal_resize_reflow_max_rows = Some(0);
 
     app.begin_thread_switch_history_replay_buffer();
 
-    assert!(app.initial_history_replay_buffer.is_none());
+    assert!(
+        app.initial_history_replay_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.render_from_transcript_tail)
+    );
 }
 
 #[tokio::test]

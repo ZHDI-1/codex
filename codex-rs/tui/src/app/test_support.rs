@@ -56,6 +56,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
         deferred_history_lines: Vec::new(),
         has_emitted_history_lines: false,
         transcript_reflow: TranscriptReflowState::default(),
+        background_reflow: Default::default(),
         initial_history_replay_buffer: None,
         pending_thread_switch_resets: 0,
         scrollback_has_older_history: false,
