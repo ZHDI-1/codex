@@ -55,7 +55,10 @@ def prepare(root: Path, candidate: Path, tag: str, repository: str, revision: st
     # Keep the maintenance recipe in the resulting release's source tree.
     shutil.copytree(root / "scripts/downstream", candidate / "scripts/downstream", dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copy2(root / ".github/workflows/downstream-release.yml", candidate / ".github/workflows/downstream-release.yml")
+    # Release tags must use the default branch's approved workflow files. Otherwise
+    # GitHub requires Workflows:write, which the built-in GITHUB_TOKEN cannot grant.
+    shutil.rmtree(candidate / ".github/workflows")
+    shutil.copytree(root / ".github/workflows", candidate / ".github/workflows")
     configure(candidate, repository, version)
     provenance = {
         "repository": repository,

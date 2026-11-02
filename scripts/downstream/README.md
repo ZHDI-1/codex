@@ -63,6 +63,8 @@ If a patch fails against a new upstream tag, resolve it locally, retest, then mo
 Never skip a failing patch automatically. New releases are tagged with the actual
 candidate source commit, rather than the maintenance branch commit. The source patch
 and provenance record the upstream and maintenance commits used for the build.
+Release commits preserve the maintenance branch's workflow files, allowing the built-in
+token to create tags without acquiring permission to introduce new upstream workflows.
 
 To roll back within this channel, rerun the saved installer twice with
 `--release OLD_VERSION` (second run with `CODEX_INSTALL_DAEMON_ONLY=1`) and restart the

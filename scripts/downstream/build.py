@@ -42,7 +42,7 @@ def build(root: Path, dist: Path) -> None:
         raise ValueError("external dependency versions changed; refusing to publish")
     lock_digest = hashlib.sha256((rust / "Cargo.lock").read_bytes()).digest()
     run("git", "add", "codex-rs", "scripts/install/install.sh", "scripts/downstream",
-        ".github/workflows/downstream-release.yml", "downstream-provenance.json", cwd=root)
+        ".github/workflows", "downstream-provenance.json", cwd=root)
     run("git", "-c", "user.name=github-actions[bot]", "-c",
         "user.email=41898282+github-actions[bot]@users.noreply.github.com",
         "commit", "-m", f"Patched Codex {provenance['version']}", cwd=root)
