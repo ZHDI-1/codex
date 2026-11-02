@@ -382,7 +382,11 @@ impl AppServerSession {
             {
                 break;
             }
-            if let Some((config, local_settings)) = config.zip(local_settings) {
+            // Height measurement renders and highlights the page. An uncapped load has no row
+            // budget to satisfy, so leave formatting to the eventual parallel transcript render.
+            if budget.rows.is_some()
+                && let Some((config, local_settings)) = config.zip(local_settings)
+            {
                 rendered_rows = rendered_history_rows(
                     thread_id,
                     thread,
@@ -425,18 +429,35 @@ fn rendered_history_rows(
     } else {
         HistoryRenderMode::Rich
     };
-    thread_items_to_transcript_cells(
+    let cells = thread_items_to_transcript_cells(
         Some(thread_id),
         &thread.cwd,
         items,
         visibility,
         Some(config),
-    )
-    .into_iter()
-    .fold(rendered_rows, |rows, cell| {
-        let height = usize::from(cell.desired_height_for_mode(width, mode));
-        rows + height + usize::from(height != 0 && rows != 0 && !cell.is_stream_continuation())
-    })
+    );
+    rendered_cell_rows(&cells, width, mode, rendered_rows)
+}
+
+fn rendered_cell_rows(
+    cells: &[std::sync::Arc<dyn crate::history_cell::HistoryCell>],
+    width: u16,
+    mode: HistoryRenderMode,
+    rendered_rows: usize,
+) -> usize {
+    let heights = crate::history_render::map_cells(cells, |cell| {
+        (
+            usize::from(cell.desired_height_for_mode(width, mode)),
+            cell.is_stream_continuation(),
+        )
+    });
+    // Keep accounting ordered: empty cells add no separator, the first visible cell has
+    // no leading separator, and a continuation never starts a new separated block.
+    heights
+        .into_iter()
+        .fold(rendered_rows, |rows, (height, continuation)| {
+            rows + height + usize::from(height != 0 && rows != 0 && !continuation)
+        })
 }
 
 #[cfg(test)]

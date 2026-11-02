@@ -1165,6 +1165,11 @@ pub(crate) enum AppEvent {
     /// Begin buffering initial resume replay rows before they are written to scrollback.
     BeginInitialHistoryReplayBuffer,
 
+    /// CPU workers have finished preparing a history snapshot; the UI validates it before use.
+    HistoryReflowReady {
+        id: u64,
+    },
+
     /// Begin buffering thread-switch replay cells so the final scrollback write can reuse the
     /// resize-reflow tail renderer.
     BeginThreadSwitchHistoryReplayBuffer,

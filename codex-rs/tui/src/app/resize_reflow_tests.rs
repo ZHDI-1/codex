@@ -59,6 +59,7 @@ async fn initial_resume_replay_retains_scrollback_beyond_the_visible_viewport() 
     app.begin_initial_history_replay_buffer();
     let mut tui = crate::tui::test_support::make_test_tui()?;
     for cell in plain_history_cells(/*count*/ 24) {
+        app.transcript_cells.push(cell.clone());
         app.insert_history_cell_lines_with_initial_replay_buffer(
             &mut tui,
             cell.as_ref(),
@@ -66,17 +67,25 @@ async fn initial_resume_replay_retains_scrollback_beyond_the_visible_viewport() 
         );
     }
 
-    let retained_lines = &app
+    let buffer = app
         .initial_history_replay_buffer
         .as_ref()
-        .expect("initial replay buffer should remain active")
-        .retained_lines;
+        .expect("initial replay buffer should remain active");
+    assert!(buffer.render_from_transcript_tail);
+    assert!(
+        buffer.retained_lines.is_empty(),
+        "replay should defer cell formatting"
+    );
+    app.finish_initial_history_replay_buffer(&mut tui);
+    assert!(app.transcript_reflow.has_pending_reflow());
+    let rendered = app.render_transcript_lines_for_reflow(screen_size.width);
+    let retained_lines = &rendered.lines;
     assert_eq!(retained_lines.len(), 32);
     assert!(retained_lines.len() > usize::from(visible_history_rows));
-    assert!(
-        app.initial_history_replay_buffer
-            .as_ref()
-            .is_some_and(|buffer| buffer.was_truncated)
+    assert_eq!(
+        app.transcript_cells.len(),
+        24,
+        "row cap must not truncate source history"
     );
     insta::assert_snapshot!(
         retained_lines

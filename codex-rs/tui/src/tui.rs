@@ -728,6 +728,7 @@ pub struct Tui {
 struct PendingHistoryLines {
     lines: Vec<HyperlinkLine>,
     wrap_policy: HistoryLineWrapPolicy,
+    prepared: Option<crate::insert_history::PreparedHistory>,
 }
 
 fn clear_for_viewport_change<B>(terminal: &mut CustomTerminal<B>, new_area: Rect) -> Result<()>
@@ -1201,12 +1202,32 @@ impl Tui {
         }
         if let Some(last) = self.pending_history_lines.last_mut()
             && last.wrap_policy == wrap_policy
+            && last.prepared.is_none()
         {
             last.lines.extend(lines);
         } else {
-            self.pending_history_lines
-                .push(PendingHistoryLines { lines, wrap_policy });
+            self.pending_history_lines.push(PendingHistoryLines {
+                lines,
+                wrap_policy,
+                prepared: None,
+            });
         }
+        self.frame_requester().schedule_frame();
+    }
+
+    pub(crate) fn insert_prepared_history(
+        &mut self,
+        prepared: crate::insert_history::PreparedHistory,
+        wrap_policy: HistoryLineWrapPolicy,
+    ) {
+        if prepared.source.is_empty() {
+            return;
+        }
+        self.pending_history_lines.push(PendingHistoryLines {
+            lines: Vec::new(),
+            wrap_policy,
+            prepared: Some(prepared),
+        });
         self.frame_requester().schedule_frame();
     }
 
@@ -1300,13 +1321,27 @@ impl Tui {
         while !pending_history_lines.is_empty() {
             let batch = pending_history_lines.remove(/*index*/ 0);
             let mode = scrollback.history_insertion_mode(batch.wrap_policy);
-            crate::insert_history::insert_history_hyperlink_lines_with_mode_and_wrap_policy(
-                terminal,
-                &batch.lines,
-                mode,
-                batch.wrap_policy,
-                screen_size,
-            )?;
+            if let Some(prepared) = batch.prepared {
+                let result = crate::insert_history::insert_prepared_history(
+                    terminal,
+                    &prepared,
+                    mode,
+                    batch.wrap_policy,
+                    screen_size,
+                );
+                // Releasing a long transcript's fallback source can free hundreds of thousands
+                // of allocations. Keep that cleanup off the interactive thread as well.
+                crate::history_render::spawn(move || drop(prepared));
+                result?;
+            } else {
+                crate::insert_history::insert_history_hyperlink_lines_with_mode_and_wrap_policy(
+                    terminal,
+                    &batch.lines,
+                    mode,
+                    batch.wrap_policy,
+                    screen_size,
+                )?;
+            }
         }
         Ok(())
     }

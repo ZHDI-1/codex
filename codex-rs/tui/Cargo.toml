@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 autobins = false
 
+[features]
+history-render-bench = []
+
+[[example]]
+name = "history-render-bench"
+path = "examples/history_render_bench.rs"
+required-features = ["history-render-bench"]
+
 [[bin]]
 name = "codex-tui"
 path = "src/main.rs"
@@ -90,6 +98,7 @@ lazy_static = { workspace = true }
 pathdiff = { workspace = true }
 pulldown-cmark = { workspace = true, features = ["html"] }
 rand = { workspace = true }
+rayon = "1.11"
 ratatui = { workspace = true, features = [
     "scrolling-regions",
     "unstable-backend-writer",
