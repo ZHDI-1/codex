@@ -13,7 +13,6 @@ import tarfile
 import tempfile
 import textwrap
 import unittest
-from unittest.mock import patch
 
 
 INSTALL_SCRIPT = Path(__file__).with_name("install.sh")
@@ -36,12 +35,11 @@ class InstallShTest(unittest.TestCase):
                 archive, checksum, metadata = create_package_release(
                     root, metadata_version=version, binary_version=version,
                 )
-                with patch(__name__ + ".INSTALL_SCRIPT", installer):
-                    result, requests = run_installer_in(
-                        root, "latest", metadata_json=metadata, archive_path=archive,
-                        checksum_path=checksum, force_macos=True, use_mirror=True,
-                        daemon_only=daemon_only,
-                    )
+                result, requests = run_installer_in(
+                    root, "latest", metadata_json=metadata, archive_path=archive,
+                    checksum_path=checksum, force_macos=True, use_mirror=True,
+                    daemon_only=daemon_only, installer_path=installer,
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(requests), 3)
                 self.assertTrue(all(f"/{repository}/" in url for url in requests), requests)
@@ -60,9 +58,8 @@ class InstallShTest(unittest.TestCase):
                 'GITHUB_RELEASE_REPOSITORY="openai/codex"',
                 'GITHUB_RELEASE_REPOSITORY="example/patched-codex"',
             ))
-            with patch(__name__ + ".INSTALL_SCRIPT", installer):
-                result, requests = run_installer_in(root, "latest", metadata_failure=True,
-                                                    use_mirror=True)
+            result, requests = run_installer_in(root, "latest", metadata_failure=True,
+                                                use_mirror=True, installer_path=installer)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(requests, ["https://api.github.com/repos/example/patched-codex/releases/latest"])
 

@@ -88,7 +88,6 @@ def build(root: Path, dist: Path) -> None:
     # Network downloads are replaced with the exact files destined for this release.
     sys.path.insert(0, str(recipe / "scripts/install"))
     import test_install_sh as installer_test
-    installer_test.INSTALL_SCRIPT = dist / "install.sh"
     assets = [dist / package_name, dist / "codex-package_SHA256SUMS"]
     metadata = json.dumps({"tag_name": f"rust-v{provenance['version']}", "assets": [
         {"name": p.name, "digest": f"sha256:{hashlib.sha256(p.read_bytes()).hexdigest()}"}
@@ -99,7 +98,7 @@ def build(root: Path, dist: Path) -> None:
             result, requests = installer_test.run_installer_in(
                 Path(temporary), "latest", metadata_json=metadata,
                 archive_path=dist / package_name, checksum_path=dist / "codex-package_SHA256SUMS",
-                daemon_only=daemon_only, use_mirror=True,
+                daemon_only=daemon_only, use_mirror=True, installer_path=dist / "install.sh",
             )
             if result.returncode or not all(f"/{provenance['repository']}/" in url for url in requests):
                 raise ValueError(f"installer smoke test failed: {result.stdout}\n{result.stderr}")
