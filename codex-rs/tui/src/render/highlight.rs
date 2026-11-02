@@ -35,6 +35,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 #[cfg(not(test))]
@@ -56,6 +57,35 @@ use two_face::theme::EmbeddedThemeName;
 
 #[path = "highlight_streaming.rs"]
 mod streaming;
+
+#[path = "highlight_cache.rs"]
+mod highlight_cache;
+
+#[cfg(not(test))]
+static HIGHLIGHT_CACHE: OnceLock<highlight_cache::HighlightCache> = OnceLock::new();
+
+#[cfg(feature = "history-render-bench")]
+pub(crate) static BENCHMARK_CACHE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(feature = "history-render-bench")]
+pub(crate) fn benchmark_cache_stats() -> [usize; 4] {
+    #[cfg(not(test))]
+    {
+        HIGHLIGHT_CACHE
+            .get()
+            .map_or([0; 4], highlight_cache::HighlightCache::stats)
+    }
+    #[cfg(test)]
+    {
+        HIGHLIGHT_CACHE.with(highlight_cache::HighlightCache::stats)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HIGHLIGHT_CACHE: highlight_cache::HighlightCache = highlight_cache::HighlightCache::default();
+}
 
 pub(crate) use streaming::StreamingCodeHighlighter;
 
@@ -717,13 +747,33 @@ fn highlighted_line_spans(ranges: Vec<(SyntectStyle, &str)>) -> Vec<Span<'static
 /// Parse `code` using syntect for `lang` and return per-line styled spans.
 /// Each inner Vec represents one source line.  Returns None when the language
 /// is not recognized or the input exceeds safety limits.
-fn highlight_to_line_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'static>>>> {
+fn cached_highlight_lines(code: &str, lang: &str) -> Option<Arc<Vec<Line<'static>>>> {
+    if code.is_empty()
+        || code.len() > MAX_HIGHLIGHT_BYTES
+        || code.lines().count() > MAX_HIGHLIGHT_LINES
+        || code
+            .lines()
+            .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+    {
+        return None;
+    }
     let active_theme = theme_lock();
-    let theme_guard = match active_theme.read() {
-        Ok(theme_guard) => theme_guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let theme = active_theme.read().unwrap_or_else(|e| e.into_inner());
+    let revision = syntax_theme_revision();
+    let render = || {
+        highlight_to_line_spans_with_theme(code, lang, &theme)
+            .map(|spans| spans.into_iter().map(Line::from).collect())
     };
-    highlight_to_line_spans_with_theme(code, lang, &theme_guard)
+    #[cfg(not(test))]
+    {
+        HIGHLIGHT_CACHE
+            .get_or_init(highlight_cache::HighlightCache::default)
+            .get_or_init(code, lang, revision, render)
+    }
+    #[cfg(test)]
+    {
+        HIGHLIGHT_CACHE.with(|cache| cache.get_or_init(code, lang, revision, render))
+    }
 }
 
 // -- Public API ---------------------------------------------------------------
@@ -738,19 +788,21 @@ fn highlight_to_line_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'stati
 /// Used by `markdown_render` for fenced code blocks and by `exec_cell` for bash
 /// command highlighting.
 pub(crate) fn highlight_code_to_lines(code: &str, lang: &str) -> Vec<Line<'static>> {
-    if let Some(line_spans) = highlight_to_line_spans(code, lang) {
-        line_spans.into_iter().map(Line::from).collect()
-    } else {
-        // Fallback: plain text, one Line per source line.
-        // Use `lines()` instead of `split('\n')` to avoid a phantom trailing
-        // empty element when the input ends with '\n' (as pulldown-cmark emits).
-        let mut result: Vec<Line<'static>> =
-            code.lines().map(|l| Line::from(l.to_string())).collect();
-        if result.is_empty() {
-            result.push(Line::from(String::new()));
-        }
-        result
+    #[cfg(feature = "history-render-bench")]
+    if !BENCHMARK_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return uncached_highlight_spans(code, lang)
+            .map(|spans| spans.into_iter().map(Line::from).collect())
+            .unwrap_or_else(|| plain_code_lines(code));
     }
+    cached_highlight_lines(code, lang).map_or_else(|| plain_code_lines(code), Arc::unwrap_or_clone)
+}
+
+fn plain_code_lines(code: &str) -> Vec<Line<'static>> {
+    let mut result: Vec<Line<'static>> = code.lines().map(|l| Line::from(l.to_string())).collect();
+    if result.is_empty() {
+        result.push(Line::from(String::new()));
+    }
+    result
 }
 
 /// Backward-compatible wrapper for bash highlighting used by exec cells.
@@ -771,7 +823,20 @@ pub(crate) fn highlight_code_to_styled_spans(
     code: &str,
     lang: &str,
 ) -> Option<Vec<Vec<Span<'static>>>> {
-    highlight_to_line_spans(code, lang)
+    #[cfg(feature = "history-render-bench")]
+    if !BENCHMARK_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return uncached_highlight_spans(code, lang);
+    }
+    cached_highlight_lines(code, lang)
+        .map(|lines| lines.iter().map(|line| line.spans.clone()).collect())
+}
+
+/// Keep the benchmark baseline on the original allocation and parsing path.
+#[cfg(feature = "history-render-bench")]
+fn uncached_highlight_spans(code: &str, lang: &str) -> Option<Vec<Vec<Span<'static>>>> {
+    let active_theme = theme_lock();
+    let theme = active_theme.read().unwrap_or_else(|e| e.into_inner());
+    highlight_to_line_spans_with_theme(code, lang, &theme)
 }
 
 #[cfg(test)]

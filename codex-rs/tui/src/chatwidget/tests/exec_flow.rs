@@ -3,6 +3,30 @@ use codex_app_server_protocol::ThreadItem;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn history_insertion_does_not_render_without_an_active_prefix() {
+    #[derive(Debug, Default)]
+    struct VisibilityProbe(std::sync::atomic::AtomicUsize);
+    impl HistoryCell for VisibilityProbe {
+        fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![Line::from("visible cell")]
+        }
+        fn raw_lines(&self) -> Vec<Line<'static>> {
+            self.display_lines(80)
+        }
+    }
+    let (mut chat, _events, _operations) = make_chatwidget_manual(None).await;
+    chat.transcript.active_cell = None;
+    let incoming = VisibilityProbe::default();
+    assert!(chat.take_history_insertion_prefix(&incoming).is_none());
+    assert_eq!(incoming.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    chat.transcript.active_cell = Some(Box::new(VisibilityProbe::default()));
+    assert!(chat.take_history_insertion_prefix(&incoming).is_some());
+    assert_eq!(incoming.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn external_writer_snapshot_freezes_active_command_and_mcp_rows() {
     let mut rendered = Vec::new();
     for active_mcp in [false, true] {

@@ -1264,6 +1264,9 @@ impl ChatWidget {
         &mut self,
         cell: &dyn HistoryCell,
     ) -> Option<Box<dyn HistoryCell>> {
+        // Nothing can be flushed without an active cell. In particular, do not highlight and
+        // wrap every incoming replay cell merely to establish that there is no prefix to emit.
+        self.transcript.active_cell.as_ref()?;
         // Keep the placeholder session header as the active cell until real session info arrives,
         // so we can merge headers instead of committing a duplicate box to history.
         let keep_placeholder_header_active = !self.is_session_configured()

@@ -58,6 +58,61 @@ pub(crate) enum InsertHistoryMode {
     FullScreen,
 }
 
+/// Width-specific wrapping and ANSI encoding, prepared without touching the terminal. Retain the
+/// source until emission so an intervening resize can still use the normal wrapping path.
+pub(crate) struct PreparedHistory {
+    pub(crate) source: Vec<HyperlinkLine>,
+    width: u16,
+    bytes: Vec<u8>,
+    wrapped_rows: usize,
+}
+
+impl PreparedHistory {
+    fn write(&self, writer: &mut impl Write, mode: InsertHistoryMode) -> io::Result<()> {
+        let bytes = match mode {
+            InsertHistoryMode::Standard => &self.bytes,
+            InsertHistoryMode::FullScreen => self.bytes.get(2..).unwrap_or_default(),
+        };
+        writer.write_all(bytes)
+    }
+}
+
+pub(crate) fn prepare_history_hyperlink_lines(
+    source: Vec<HyperlinkLine>,
+    width: u16,
+    wrap_policy: HistoryLineWrapPolicy,
+) -> io::Result<PreparedHistory> {
+    let wrap_width = usize::from(width.max(1));
+    let chunks = crate::history_render::map_chunks(&source, 256, |lines| -> io::Result<_> {
+        let (wrapped, rows) = wrap_history_hyperlink_lines(lines, wrap_width, wrap_policy);
+        let mut bytes = Vec::new();
+        for line in &wrapped {
+            // Standard insertion needs a leading newline; full-screen skips the first one.
+            bytes.write_all(b"\r\n")?;
+            write_history_line(&mut bytes, line, wrap_width)?;
+        }
+        Ok((bytes, rows))
+    });
+    let capacity = chunks
+        .iter()
+        .filter_map(|chunk| chunk.as_ref().ok())
+        .map(|(bytes, _)| bytes.len())
+        .sum();
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut wrapped_rows = 0;
+    for chunk in chunks {
+        let (chunk, rows) = chunk?;
+        bytes.extend_from_slice(&chunk);
+        wrapped_rows += rows;
+    }
+    Ok(PreparedHistory {
+        source,
+        width: width.max(1),
+        bytes,
+        wrapped_rows,
+    })
+}
+
 /// Insert `lines` above the viewport using the terminal's backend writer
 /// (avoids direct stdout references).
 pub fn insert_history_lines<B>(
@@ -115,10 +170,6 @@ pub(crate) fn insert_history_hyperlink_lines_with_mode_and_wrap_policy<B>(
 where
     B: Backend<Error = io::Error> + Write,
 {
-    let mut area = terminal.viewport_area;
-    let mut should_update_area = false;
-    let last_cursor_pos = terminal.last_known_cursor_pos;
-
     // Pre-wrap lines for terminal scrollback. Three paths:
     //
     // - URL-only-ish lines are kept intact (no hard newlines inserted) so that
@@ -130,9 +181,34 @@ where
     //   unsplit.
     // - Non-URL lines also flow through adaptive wrapping; behavior is
     //   equivalent to standard wrapping when no URL is present.
-    let wrap_width = area.width.max(1) as usize;
-    let (wrapped, wrapped_rows) = wrap_history_hyperlink_lines(lines, wrap_width, wrap_policy);
-    let wrapped_lines = wrapped_rows as u16;
+    let prepared =
+        prepare_history_hyperlink_lines(lines.to_vec(), terminal.viewport_area.width, wrap_policy)?;
+    insert_prepared_history(terminal, &prepared, mode, wrap_policy, screen_size)
+}
+
+pub(crate) fn insert_prepared_history<B>(
+    terminal: &mut crate::custom_terminal::Terminal<B>,
+    prepared: &PreparedHistory,
+    mode: InsertHistoryMode,
+    wrap_policy: HistoryLineWrapPolicy,
+    screen_size: Size,
+) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + Write,
+{
+    if prepared.width != terminal.viewport_area.width.max(1) {
+        return insert_history_hyperlink_lines_with_mode_and_wrap_policy(
+            terminal,
+            &prepared.source,
+            mode,
+            wrap_policy,
+            screen_size,
+        );
+    }
+    let mut area = terminal.viewport_area;
+    let mut should_update_area = false;
+    let last_cursor_pos = terminal.last_known_cursor_pos;
+    let wrapped_lines = prepared.wrapped_rows as u16;
     match mode {
         InsertHistoryMode::FullScreen => {
             // The existing viewport is immediately replaced in the same draw pass. Clear it
@@ -140,12 +216,7 @@ where
             terminal.clear_after_position(area.as_position())?;
             let writer = terminal.backend_mut();
             queue!(writer, MoveTo(/*x*/ 0, area.top()))?;
-            for (index, line) in wrapped.iter().enumerate() {
-                if index > 0 {
-                    queue!(writer, Print("\r\n"))?;
-                }
-                write_history_line(writer, line, wrap_width)?;
-            }
+            prepared.write(writer, mode)?;
 
             // Writing raw source text through the terminal preserves its soft-wrap metadata.
             // Advance through empty rows for the viewport so history ends immediately above the
@@ -209,10 +280,7 @@ where
             // fetch/restore the cursor position. insert_history_lines should be cursor-position-neutral :)
             queue!(writer, MoveTo(/*x*/ 0, cursor_top))?;
 
-            for line in &wrapped {
-                queue!(writer, Print("\r\n"))?;
-                write_history_line(writer, line, wrap_width)?;
-            }
+            prepared.write(writer, mode)?;
 
             queue!(writer, ResetScrollRegion)?;
             queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
@@ -433,7 +501,114 @@ mod tests {
     use crate::test_backend::VT100Backend;
     use ratatui::layout::Rect;
     use ratatui::style::Color;
+    use ratatui::style::Style;
 
+    #[test]
+    fn parallel_preparation_preserves_order_styles_links_and_control_filtering() {
+        crossterm::style::force_color_output(true);
+        let lines: Vec<_> = (0..1025)
+            .map(|index| {
+                crate::terminal_hyperlinks::annotate_web_urls_in_line(Line::from(vec![
+                    Span::styled(
+                        format!("  {index}: 界 e\u{301} "),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::raw("https://example.test/a/long/path"),
+                    Span::raw(" \x1b[2J\r\n untrusted"),
+                ]))
+            })
+            .collect();
+        for policy in [
+            HistoryLineWrapPolicy::PreWrap,
+            HistoryLineWrapPolicy::Terminal,
+        ] {
+            let prepared = prepare_history_hyperlink_lines(lines.clone(), 31, policy).unwrap();
+            let (wrapped, rows) = wrap_history_hyperlink_lines(&lines, 31, policy);
+            let mut sequential = Vec::new();
+            for line in &wrapped {
+                sequential.extend_from_slice(b"\r\n");
+                write_history_line(&mut sequential, line, 31).unwrap();
+            }
+            assert_eq!(prepared.bytes, sequential);
+            assert_eq!(prepared.wrapped_rows, rows);
+        }
+    }
+
+    #[test]
+    fn prepared_history_writes_one_payload_instead_of_one_write_per_row() {
+        #[derive(Default)]
+        struct Writer {
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let prepared = prepare_history_hyperlink_lines(
+            (0..1000)
+                .map(|index| Line::from(format!("row {index}")).into())
+                .collect(),
+            80,
+            HistoryLineWrapPolicy::PreWrap,
+        )
+        .unwrap();
+        for mode in [InsertHistoryMode::Standard, InsertHistoryMode::FullScreen] {
+            let mut writer = Writer::default();
+            prepared.write(&mut writer, mode).unwrap();
+            assert_eq!(writer.writes, 1);
+            let start = usize::from(mode == InsertHistoryMode::FullScreen) * 2;
+            assert_eq!(writer.bytes, prepared.bytes[start..]);
+        }
+    }
+
+    #[test]
+    fn prepared_history_rewraps_if_width_changes_before_emission() {
+        let lines = plain_hyperlink_lines(vec![Line::from(
+            "  Long source with 界 and words that must wrap at the new width.",
+        )]);
+        let prepared =
+            prepare_history_hyperlink_lines(lines.clone(), 80, HistoryLineWrapPolicy::PreWrap)
+                .unwrap();
+        for mode in [InsertHistoryMode::Standard, InsertHistoryMode::FullScreen] {
+            let make_terminal = || {
+                let mut terminal =
+                    crate::custom_terminal::Terminal::with_options(VT100Backend::new(24, 12))
+                        .unwrap();
+                terminal.set_viewport_area(Rect::new(0, 11, 24, 1));
+                terminal
+            };
+            let mut actual = make_terminal();
+            let mut expected = make_terminal();
+            insert_prepared_history(
+                &mut actual,
+                &prepared,
+                mode,
+                HistoryLineWrapPolicy::PreWrap,
+                Size::new(24, 12),
+            )
+            .unwrap();
+            insert_history_hyperlink_lines_with_mode_and_wrap_policy(
+                &mut expected,
+                &lines,
+                mode,
+                HistoryLineWrapPolicy::PreWrap,
+                Size::new(24, 12),
+            )
+            .unwrap();
+            assert_eq!(
+                actual.backend().vt100().screen().contents_formatted(),
+                expected.backend().vt100().screen().contents_formatted()
+            );
+            assert_eq!(actual.viewport_area, expected.viewport_area);
+        }
+    }
     #[test]
     fn writes_bold_then_regular_spans() {
         use ratatui::style::Stylize;

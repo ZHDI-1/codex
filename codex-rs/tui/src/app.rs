@@ -579,6 +579,7 @@ pub(crate) struct App {
     pub(crate) deferred_history_lines: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
     has_emitted_history_lines: bool,
     transcript_reflow: TranscriptReflowState,
+    background_reflow: resize_reflow::BackgroundReflow,
     initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
     pending_thread_switch_resets: usize,
     pub(crate) scrollback_has_older_history: bool,
