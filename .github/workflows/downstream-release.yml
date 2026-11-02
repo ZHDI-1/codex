@@ -78,7 +78,8 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc /usr/share/swift
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends binutils build-essential pkg-config libcap-dev libssl-dev cmake clang libclang-dev
-      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      - uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        id: downloads
         if: steps.select.outputs.changed == 'true'
         with:
           path: |
@@ -88,11 +89,15 @@ jobs:
           key: codex-downloads-${{ runner.os }}-${{ steps.prepare.outputs.toolchain }}-${{ steps.select.outputs.upstream_tag }}
           restore-keys: |
             codex-downloads-${{ runner.os }}-${{ steps.prepare.outputs.toolchain }}-
-      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # pinned action
+      - name: Install the upstream Rust toolchain and musl target
         if: steps.select.outputs.changed == 'true'
-        with:
-          toolchain: ${{ steps.prepare.outputs.toolchain }}
-          targets: x86_64-unknown-linux-musl
+        env:
+          RUST_TOOLCHAIN: ${{ steps.prepare.outputs.toolchain }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --component clippy,rustfmt,rust-src --target x86_64-unknown-linux-musl
+          echo "RUSTUP_TOOLCHAIN=$RUST_TOOLCHAIN" >> "$GITHUB_ENV"
+          rustup target list --installed --toolchain "$RUST_TOOLCHAIN"
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         if: steps.select.outputs.changed == 'true'
         with:
@@ -108,6 +113,17 @@ jobs:
         env:
           CANDIDATE: ${{ steps.prepare.outputs.candidate }}
         run: python3 scripts/downstream/build.py "$CANDIDATE" "$RUNNER_TEMP/dist"
+      - uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        if: >-
+          !cancelled() && steps.prepare.outputs.candidate != '' &&
+          steps.downloads.outputs.cache-hit != 'true'
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/codex-package
+          key: codex-downloads-${{ runner.os }}-${{ steps.prepare.outputs.toolchain }}-${{ steps.select.outputs.upstream_tag }}
       - name: Publish complete release
         if: steps.select.outputs.changed == 'true'
         env:
