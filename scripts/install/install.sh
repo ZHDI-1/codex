@@ -3,10 +3,16 @@
 set -eu
 
 RELEASE="${CODEX_RELEASE:-latest}"
+# The downstream build script stamps this value into the published installer.
+GITHUB_RELEASE_REPOSITORY="ZHDI-1/codex"
 NON_INTERACTIVE="${CODEX_NON_INTERACTIVE:-false}"
 DAEMON_ONLY="${CODEX_INSTALL_DAEMON_ONLY:-0}"
 DEFAULT_PREFER_RELEASES_OPENAI_COM="true"
 PREFER_RELEASES_OPENAI_COM="${CODEX_INSTALLER_USE_RELEASES_OPENAI_COM:-$DEFAULT_PREFER_RELEASES_OPENAI_COM}"
+if [ "$GITHUB_RELEASE_REPOSITORY" != "openai/codex" ]; then
+  # A failed downstream download must never select an unpatched official build.
+  PREFER_RELEASES_OPENAI_COM="false"
+fi
 RELEASES_BASE_URL="https://releases.openai.com/codex"
 RELEASES_CONNECT_TIMEOUT=10
 RELEASES_METADATA_TIMEOUT=30
@@ -71,6 +77,11 @@ validate_version() {
   version="$1"
 
   if [ "$version" = "latest" ]; then
+    return
+  fi
+
+  if [ "$GITHUB_RELEASE_REPOSITORY" != "openai/codex" ] &&
+    printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\+patched\.[1-9][0-9]*$'; then
     return
   fi
 
@@ -320,7 +331,7 @@ release_url_for_asset() {
   asset="$1"
   resolved_version="$2"
 
-  printf 'https://github.com/openai/codex/releases/download/rust-v%s/%s\n' "$resolved_version" "$asset"
+  printf 'https://github.com/%s/releases/download/rust-v%s/%s\n' "$GITHUB_RELEASE_REPOSITORY" "$resolved_version" "$asset"
 }
 
 releases_url_for_asset() {
@@ -333,7 +344,11 @@ releases_url_for_asset() {
 release_metadata_url() {
   resolved_version="$1"
 
-  printf 'https://api.github.com/repos/openai/codex/releases/tags/rust-v%s\n' "$resolved_version"
+  if [ "$GITHUB_RELEASE_REPOSITORY" != "openai/codex" ]; then
+    release_url_for_asset "release.json" "$resolved_version"
+  else
+    printf 'https://api.github.com/repos/%s/releases/tags/rust-v%s\n' "$GITHUB_RELEASE_REPOSITORY" "$resolved_version"
+  fi
 }
 
 parse_downloaded_release_metadata() {
@@ -362,7 +377,12 @@ resolve_release_from_github() {
   normalized_version="$1"
   if [ "$normalized_version" = "latest" ]; then
     requested_release="latest"
-    metadata_url="https://api.github.com/repos/openai/codex/releases/latest"
+    if [ "$GITHUB_RELEASE_REPOSITORY" != "openai/codex" ]; then
+      # Published metadata avoids the anonymous GitHub API's shared-IP quota.
+      metadata_url="https://github.com/$GITHUB_RELEASE_REPOSITORY/releases/latest/download/release.json"
+    else
+      metadata_url="https://api.github.com/repos/$GITHUB_RELEASE_REPOSITORY/releases/latest"
+    fi
   else
     resolved_version="$normalized_version"
     requested_release="$resolved_version"
@@ -370,14 +390,18 @@ resolve_release_from_github() {
   fi
 
   if ! release_json="$(download_text "$metadata_url")"; then
-    echo "Could not fetch GitHub release metadata for Codex $requested_release. GitHub API may be unavailable or rate limited." >&2
+    echo "Could not fetch GitHub release metadata for Codex $requested_release from $metadata_url." >&2
     exit 1
   fi
 
   parse_downloaded_release_metadata "$requested_release" "GitHub"
 
-  if [ "$normalized_version" = "latest" ]; then
+  if [ "$normalized_version" = "latest" ] || [ "$GITHUB_RELEASE_REPOSITORY" != "openai/codex" ]; then
     resolve_metadata_version
+    if [ "$normalized_version" != "latest" ] && [ "$metadata_version" != "$normalized_version" ]; then
+      echo "Release metadata version did not match requested Codex version $normalized_version." >&2
+      return 1
+    fi
     resolved_version="$metadata_version"
   fi
 

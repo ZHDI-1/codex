@@ -94,6 +94,7 @@ impl App {
                     | AppEvent::BeginInitialHistoryReplayBuffer
                     | AppEvent::BeginThreadSwitchHistoryReplayBuffer
                     | AppEvent::EndInitialHistoryReplayBuffer
+                    | AppEvent::HistoryReflowReady { .. }
                     | AppEvent::FatalExitRequest(_)
             )
         {
@@ -884,6 +885,11 @@ impl App {
             }
             AppEvent::BeginInitialHistoryReplayBuffer => {
                 self.begin_initial_history_replay_buffer();
+            }
+            AppEvent::HistoryReflowReady { id } => {
+                if self.background_reflow.is_current(id) {
+                    tui.frame_requester().schedule_frame();
+                }
             }
             AppEvent::BeginThreadSwitchHistoryReplayBuffer => {
                 self.begin_thread_switch_history_replay_buffer();

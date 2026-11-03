@@ -77,9 +77,15 @@ impl App {
         let width = self
             .chat_widget
             .history_wrap_width(tui.terminal.last_known_screen_size.width);
+        let buffered_replay = self
+            .initial_history_replay_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.render_from_transcript_tail);
         // Owned replay must not eagerly format every historical entry. Composite status cards are
         // the only committed cells whose mutable usage data needs insertion-time bookkeeping.
-        let lines = if !deferred || cell.as_any().is::<history_cell::CompositeHistoryCell>() {
+        let lines = if (!deferred && !buffered_replay)
+            || cell.as_any().is::<history_cell::CompositeHistoryCell>()
+        {
             cell.display_hyperlink_lines_for_mode(width, self.chat_widget.history_render_mode())
         } else {
             Vec::new()
@@ -97,7 +103,7 @@ impl App {
             });
         }
         // Invisible diagnostics still update the badge without replacing the rendered tail.
-        if deferred || lines.is_empty() {
+        if deferred || buffered_replay || lines.is_empty() {
             tui.frame_requester().schedule_frame();
             return;
         }
@@ -179,6 +185,9 @@ impl App {
             self.pending_thread_usage_history_refresh = false;
             return Ok(());
         }
+        // Usage cards can change behind the same Arc. Do not let an older prepared snapshot
+        // overwrite the freshly refreshed card merely because source identity and width match.
+        self.background_reflow.invalidate();
         if tui.is_owned_screen() {
             // Composite cells are backed by mutable usage state, so the retained view remeasures
             // them on its next frame without replacing native terminal history.
@@ -405,6 +414,7 @@ impl App {
         self.deferred_history_lines.clear();
         self.has_emitted_history_lines = false;
         self.transcript_reflow.clear();
+        self.background_reflow.clear();
         self.chat_widget.clear_pending_rate_limit_reset_hint();
         self.initial_history_replay_buffer = None;
         self.scrollback_has_older_history = false;

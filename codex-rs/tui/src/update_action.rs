@@ -20,7 +20,7 @@ pub enum UpdateAction {
     PnpmGlobalLatest,
     /// Update via `brew upgrade codex`.
     BrewUpgrade,
-    /// Update via the standalone Unix installer.
+    /// Update via the configured standalone Unix installer.
     StandaloneUnix,
     /// Update via `$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex`.
     StandaloneWindows,
@@ -56,7 +56,7 @@ impl UpdateAction {
                 "sh",
                 &[
                     "-c",
-                    r#"s=$(curl -fsSL https://chatgpt.com/codex/install.sh) && CODEX_NON_INTERACTIVE=1 eval "$s""#,
+                    codex_install_context::release_channel::INSTALLER_COMMAND,
                 ],
             ),
             UpdateAction::StandaloneWindows => (
@@ -65,7 +65,7 @@ impl UpdateAction {
                     "-ExecutionPolicy",
                     "Bypass",
                     "-c",
-                    "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex",
+                    codex_install_context::release_channel::WINDOWS_INSTALLER_COMMAND,
                 ],
             ),
         }
@@ -81,6 +81,13 @@ impl UpdateAction {
 
 #[cfg(not(debug_assertions))]
 pub fn get_update_action() -> Option<UpdateAction> {
+    if codex_install_context::release_channel::is_downstream() {
+        return Some(if cfg!(windows) {
+            UpdateAction::StandaloneWindows
+        } else {
+            UpdateAction::StandaloneUnix
+        });
+    }
     UpdateAction::from_install_context(InstallContext::current())
 }
 
@@ -156,7 +163,17 @@ mod tests {
     }
 
     #[test]
-    fn standalone_windows_update_command_reruns_latest_installer() {
+    fn standalone_update_commands_rerun_latest_installer() {
+        assert_eq!(
+            UpdateAction::StandaloneUnix.command_args(),
+            (
+                "sh",
+                &[
+                    "-c",
+                    codex_install_context::release_channel::INSTALLER_COMMAND
+                ][..],
+            )
+        );
         assert_eq!(
             UpdateAction::StandaloneWindows.command_args(),
             (
@@ -165,7 +182,7 @@ mod tests {
                     "-ExecutionPolicy",
                     "Bypass",
                     "-c",
-                    "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
+                    codex_install_context::release_channel::WINDOWS_INSTALLER_COMMAND
                 ][..],
             )
         );
@@ -173,19 +190,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn standalone_unix_update_fails_when_installer_download_fails() {
-        let (command, args) = UpdateAction::StandaloneUnix.command_args();
-        let offline_command = args[1].replace("https://chatgpt.com", "file:///dev/null");
-        assert_ne!(offline_command, args[1], "installer URL must be replaced");
-        let output = std::process::Command::new(command)
-            .args([args[0], &offline_command])
-            .env_clear()
-            .env("HOME", "/dev/null")
-            .env("PATH", "/usr/bin:/bin")
-            .output()
-            .expect("run standalone Unix update command");
+    fn standalone_unix_update_propagates_download_failures() {
+        use std::os::unix::fs::PermissionsExt;
 
-        assert!(!output.status.success(), "{output:?}");
+        let directory = tempfile::tempdir().expect("temporary downloader");
+        let downloader = directory.path().join("curl");
+        std::fs::write(&downloader, "#!/bin/sh\nexit 22\n").expect("fake curl");
+        std::fs::set_permissions(&downloader, std::fs::Permissions::from_mode(0o755))
+            .expect("executable downloader");
+        let (command, args) = UpdateAction::StandaloneUnix.command_args();
+        let output = std::process::Command::new(command)
+            .args(args)
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", directory.path().display()),
+            )
+            .output()
+            .expect("run updater");
+        assert_eq!(output.status.code(), Some(22));
     }
 }
 

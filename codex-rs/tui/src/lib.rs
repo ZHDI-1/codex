@@ -160,6 +160,9 @@ mod git_action_directives;
 mod goal_display;
 mod goal_files;
 mod history_cell;
+mod history_render;
+#[cfg(feature = "history-render-bench")]
+pub mod history_render_benchmark;
 mod hooks_rpc;
 mod ide_context;
 mod inline_visualization;
