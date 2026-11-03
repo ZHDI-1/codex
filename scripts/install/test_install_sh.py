@@ -61,7 +61,7 @@ class InstallShTest(unittest.TestCase):
             result, requests = run_installer_in(root, "latest", metadata_failure=True,
                                                 use_mirror=True, installer_path=installer)
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(requests, ["https://api.github.com/repos/example/patched-codex/releases/latest"])
+            self.assertEqual(requests, ["https://github.com/example/patched-codex/releases/latest/download/release.json"])
 
     def test_metadata_fetch_failure_is_not_reported_as_missing_assets(self) -> None:
         result, requests = run_installer(VERSION, metadata_failure=True)
@@ -1077,7 +1077,7 @@ def run_installer_in(
             printf '%s\n' "$url" >>"$CODEX_TEST_REQUEST_LOG"
 
             case "$url" in
-              https://api.github.com/*)
+              https://api.github.com/*|https://github.com/*/*/releases/latest/download/release.json|https://github.com/*/*/releases/download/*/release.json)
                 if [ "$CODEX_TEST_METADATA_FAILURE" = "1" ]; then
                   echo "curl: (22) The requested URL returned error: 403" >&2
                   exit 22

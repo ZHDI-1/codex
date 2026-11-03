@@ -89,17 +89,21 @@ mod tests {
 
     #[test]
     fn channel_endpoints_and_cache_have_the_same_owner() {
-        assert_eq!(
-            LATEST_RELEASE_URL,
-            format!("https://api.github.com/repos/{REPOSITORY}/releases/latest")
-        );
         if is_downstream() {
+            assert_eq!(
+                LATEST_RELEASE_URL,
+                format!("{RELEASE_NOTES_URL}/download/release.json")
+            );
             assert_eq!(
                 INSTALLER_URL,
                 format!("{RELEASE_NOTES_URL}/download/install.sh")
             );
             assert_ne!(VERSION_CACHE_FILENAME, "version.json");
         } else {
+            assert_eq!(
+                LATEST_RELEASE_URL,
+                format!("https://api.github.com/repos/{REPOSITORY}/releases/latest")
+            );
             assert_eq!(INSTALLER_URL, "https://chatgpt.com/codex/install.sh");
             assert_eq!(VERSION_CACHE_FILENAME, "version.json");
         }

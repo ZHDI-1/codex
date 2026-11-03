@@ -18,6 +18,11 @@ fn main() {
     );
     let downstream = repository != "openai/codex";
     let releases = format!("https://github.com/{repository}/releases/latest");
+    let metadata = if downstream {
+        format!("{releases}/download/release.json")
+    } else {
+        format!("https://api.github.com/repos/{repository}/releases/latest")
+    };
     let installer = if downstream {
         format!("{releases}/download/install.sh")
     } else {
@@ -30,10 +35,7 @@ fn main() {
     };
     for (name, value) in [
         ("CODEX_RELEASE_REPOSITORY", repository.clone()),
-        (
-            "CODEX_RELEASE_API_URL",
-            format!("https://api.github.com/repos/{repository}/releases/latest"),
-        ),
+        ("CODEX_RELEASE_API_URL", metadata),
         ("CODEX_RELEASE_NOTES_URL", releases),
         ("CODEX_INSTALLER_URL", installer.clone()),
         ("CODEX_WINDOWS_INSTALLER_URL", windows_installer.clone()),

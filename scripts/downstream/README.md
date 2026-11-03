@@ -41,6 +41,11 @@ compare numerically; standard SemVer alone would ignore build metadata. The inst
 never falls back to an official package. Ordinary builds without this environment
 variable keep the official channel.
 
+Downstream installers and update checks read `release.json` from GitHub release assets
+through `github.com`, avoiding the anonymous `api.github.com` rate limit on shared proxies.
+The publisher includes package and checksum-manifest digests in this metadata. The bootstrap
+also verifies the installer against the same release's `SHA256SUMS` before running it.
+
 The release contains the client, the matching daemon-capable executable, code-mode host,
 Linux bwrap and platform-specific ripgrep resources, package checksums, source patch, and
 build provenance. Each platform has a separate symbols archive for all three first-party
@@ -88,6 +93,11 @@ Both installations select `latest`, so subsequent client updates and daemon auto
 follow our releases. The daemon-only installer preserves the visible CLI. A pinned
 `--release VERSION` installation deliberately disables automatic updates for that package.
 `--from-cli` installs are local pins, so use the daemon-only installer for this channel.
+
+The bootstrap can also be rerun to install a newer release when an older binary's update
+check cannot reach its compiled metadata URL. Release `0.166.0+patched.4` still uses the
+GitHub API inside the binary; its repaired installer uses release assets without rebuilding
+the packages. The compiled URL changes with the next build.
 
 This recipe replaces the normal `codex` installation and managed daemon. It does not
 change login, model availability, session files, or runtime configuration. Do not rerun

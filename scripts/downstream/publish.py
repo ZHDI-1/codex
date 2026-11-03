@@ -10,6 +10,19 @@ import tarfile
 from platforms import TARGETS, sha256
 
 
+def write_release_metadata(dist, version):
+    # Keep the GitHub API's shape so both the shell installer and TUI can read it
+    # through github.com release downloads without consuming anonymous API quota.
+    names = [f"codex-package-{target}.tar.gz" for target in TARGETS]
+    names.append("codex-package_SHA256SUMS")
+    metadata = {
+        "tag_name": f"rust-v{version}",
+        "assets": [{"name": name, "digest": f"sha256:{sha256(dist / name)}"}
+                   for name in sorted(names)],
+    }
+    (dist / "release.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+
 def assemble(candidate, source, inputs, dist, expected_commit):
     metadata = json.loads((source / "source.json").read_text())
     if metadata["build_commit"] != expected_commit:
@@ -52,6 +65,7 @@ def assemble(candidate, source, inputs, dist, expected_commit):
     metadata["targets"] = list(TARGETS)
     metadata["signing"] = {target: reports[target]["signing"] for target in TARGETS}
     (dist / "provenance.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    write_release_metadata(dist, metadata["version"])
     (dist / "SHA256SUMS").write_text(
         "".join(f"{sha256(p)}  {p.name}\n" for p in sorted(dist.iterdir())))
 
