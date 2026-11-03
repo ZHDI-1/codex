@@ -13,6 +13,94 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+#[tokio::test]
+async fn prompt_edit_reads_only_the_selected_prompt_and_rejects_stale_or_steered_selections()
+-> color_eyre::Result<()> {
+    use crate::app_server_session::AppServerSession;
+    use crate::app_server_session::ThreadParamsMode;
+    use codex_app_server_protocol::JSONRPCMessage;
+    use codex_protocol::ThreadId;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for (latest, first_item, error) in [
+        ("selected-turn", "selected-item", None),
+        (
+            "changed-turn",
+            "selected-item",
+            Some("thread history changed"),
+        ),
+        ("selected-turn", "earlier-input", Some("steer")),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            let mut requests = Vec::new();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else {
+                    continue;
+                };
+                let mut reply = match request.method.as_str() {
+                    "initialize" => json!({"result": {"userAgent": "prompt-edit-test/1.0"}}),
+                    "thread/turns/list" => {
+                        requests.push((request.method, request.params.unwrap()));
+                        json!({"result": {"data": [{
+                            "id": latest, "items": [], "status": "completed"
+                        }], "nextCursor": null, "backwardsCursor": null}})
+                    }
+                    "thread/items/list" => {
+                        let params = request.params.unwrap();
+                        assert_eq!(params["turnId"], "selected-turn");
+                        assert_eq!(params["sortDirection"], "asc");
+                        assert_eq!(params["limit"], 1);
+                        requests.push((request.method, params));
+                        json!({"result": {"data": [{
+                            "turnId": "selected-turn", "item": {
+                                "type": "userMessage", "id": first_item,
+                                "content": [{"type": "text", "text": "selected prompt", "textElements": []}]
+                            }
+                        }], "nextCursor": null, "backwardsCursor": null}})
+                    }
+                    method => panic!("unexpected prompt-edit request: {method}"),
+                };
+                reply["id"] = json!(request.id);
+                socket.send(Message::Text(reply.to_string().into())).await?;
+            }
+            Ok::<_, color_eyre::Report>(requests)
+        });
+        let mut session = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            crate::connect_remote_app_server(endpoint).await?,
+            ThreadParamsMode::Embedded,
+        );
+        let result = session
+            .prompt_edit_turn(
+                ThreadId::new(),
+                "selected-turn",
+                "selected-item",
+                Some("selected-turn"),
+            )
+            .await;
+        if let Some(error) = error {
+            assert!(format!("{:#}", result.unwrap_err()).contains(error));
+        } else {
+            let turn = result?;
+            assert_eq!(turn.id, "selected-turn");
+            assert_eq!(turn.items.len(), 1);
+            assert_eq!(turn.items[0].id(), "selected-item");
+        }
+        session.shutdown().await?;
+        let requests = server.await??;
+        assert_eq!(requests.len(), if latest == "changed-turn" { 1 } else { 2 });
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct HeightMeasuredCell {
     height: u16,

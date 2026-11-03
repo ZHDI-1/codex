@@ -137,6 +137,80 @@ pub(crate) struct ThreadHistoryPagination {
 }
 
 impl AppServerSession {
+    /// Validate a displayed prompt without downloading the tool-heavy history window again.
+    /// Turn metadata guards the same tail identity as the full-history path. Reading the
+    /// selected turn from its beginning proves that this item is not a mid-turn steer.
+    pub(crate) async fn prompt_edit_turn(
+        &mut self,
+        thread_id: ThreadId,
+        turn_id: &str,
+        item_id: &str,
+        expected_latest_turn_id: Option<&str>,
+    ) -> Result<Turn> {
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        let mut turn = loop {
+            let page = self
+                .thread_turns_page(thread_id, cursor.clone(), HISTORY_ITEM_PAGE_LIMIT)
+                .await?;
+            if cursor.is_none()
+                && page.data.first().map(|turn| turn.id.as_str()) != expected_latest_turn_id
+            {
+                color_eyre::eyre::bail!(
+                    "thread history changed; reload the session before editing this prompt"
+                );
+            }
+            if let Some(turn) = page.data.into_iter().find(|turn| turn.id == turn_id) {
+                break turn;
+            }
+            cursor = advancing_cursor(cursor.as_deref(), page.next_cursor, &mut seen);
+            if cursor.is_none() {
+                color_eyre::eyre::bail!("the selected turn no longer exists");
+            }
+        };
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        loop {
+            let request_id = self.next_request_id();
+            let page: ThreadItemsListResponse = self
+                .client
+                .request_typed(ClientRequest::ThreadItemsList {
+                    request_id,
+                    params: ThreadItemsListParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: Some(turn_id.to_string()),
+                        cursor: cursor.clone().map(ThreadItemsListCursor::Opaque),
+                        // The normal first item is the prompt: avoid transferring any tool
+                        // output at all. Unusual leading items continue in bounded pages.
+                        limit: Some(if cursor.is_none() {
+                            1
+                        } else {
+                            HISTORY_ITEM_PAGE_LIMIT
+                        }),
+                        sort_direction: Some(SortDirection::Asc),
+                    },
+                })
+                .await?;
+            for entry in page.data {
+                if matches!(&entry.item.payload, ThreadItemPayload::UserMessage { .. }) {
+                    if entry.item.id() != item_id {
+                        color_eyre::eyre::bail!(
+                            "the selected prompt is a steer and cannot be edited independently"
+                        );
+                    }
+                    turn.items = vec![entry.item];
+                    return Ok(turn);
+                }
+            }
+            cursor = advancing_cursor(cursor.as_deref(), page.next_cursor, &mut seen);
+            if cursor.is_none() {
+                color_eyre::eyre::bail!(
+                    "the selected prompt was not found in the persisted thread"
+                );
+            }
+        }
+    }
+
     pub(crate) async fn revert_thread(
         &mut self,
         thread_id: ThreadId,

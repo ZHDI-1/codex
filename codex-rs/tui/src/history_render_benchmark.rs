@@ -95,6 +95,7 @@ pub fn run() -> anyhow::Result<serde_json::Value> {
                     ));
                 } else {
                     cells.push(Arc::new(crate::history_cell::UserHistoryCell {
+                        item_id: Default::default(),
                         message: text,
                         text_elements: Vec::new(),
                         local_image_paths: Vec::new(),

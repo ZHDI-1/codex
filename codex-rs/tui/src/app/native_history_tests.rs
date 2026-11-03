@@ -30,6 +30,9 @@ async fn quota_warnings_are_emitted_once_and_survive_native_replay() -> Result<(
             }
         }
         app.finish_initial_history_replay_buffer(&mut tui);
+        // Source-backed initial replay emits on the scheduled draw, not at the
+        // replay barrier. Drive that reflow before inspecting terminal output.
+        app.maybe_run_resize_reflow(&mut tui, Size::new(80, 24))?;
         let inserted = tui.pending_history_lines_for_test();
         insta::allow_duplicates! {
             insta::assert_snapshot!("native_quota_warning", inserted.iter().map(|line| line.line.to_string()).collect::<Vec<_>>().join("\n"));
@@ -116,10 +119,16 @@ async fn settled_tool_precedes_queued_output_and_is_not_emitted_twice() -> Resul
     for cell in app.transcript_cells.iter().rev().take(CELLS_PER_FRAME + 1) {
         app.native_history.defer(cell);
     }
-    app.rebuild_transcript_after_backtrack(
-        &mut tui,
-        ratatui::layout::Size::new(/*width*/ 80, /*height*/ 24).into(),
-    )?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !app.rebuild_transcript_after_backtrack(
+            &mut tui,
+            ratatui::layout::Size::new(/*width*/ 80, /*height*/ 24).into(),
+        )? {
+            tokio::task::yield_now().await;
+        }
+        Ok::<_, color_eyre::Report>(())
+    })
+    .await??;
     let replayed = tui.pending_history_lines_for_test();
     app.flush_native_history(&mut tui);
     assert_eq!(tui.pending_history_lines_for_test(), replayed);

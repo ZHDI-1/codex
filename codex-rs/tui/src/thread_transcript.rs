@@ -265,7 +265,8 @@ fn item_to_cells(
                 elements,
                 item.local_image_paths(),
                 item.image_urls(),
-            );
+            )
+            .with_item_id(item.id.clone());
             cells.push(Arc::new(cell.with_async_replies(replies, cwd.as_path())));
         }
         ThreadItemPayload::AgentMessage {

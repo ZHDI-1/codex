@@ -55,6 +55,7 @@ fn overlapping_history_keeps_live_turn_state_and_newer_items() {
 
 fn user_cell(message: &str) -> Arc<dyn HistoryCell> {
     Arc::new(UserHistoryCell {
+        item_id: Default::default(),
         presentation: Default::default(),
         message: message.to_string(),
         text_elements: Vec::new(),

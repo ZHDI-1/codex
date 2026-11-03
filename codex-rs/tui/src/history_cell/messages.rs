@@ -20,6 +20,9 @@ pub(crate) struct UserHistoryCell {
     pub local_image_paths: Vec<PathBuf>,
     pub remote_image_urls: Vec<String>,
     pub(crate) presentation: UserMessagePresentation,
+    /// Server item identity, filled when an optimistic submission is acknowledged.
+    /// This is display-only metadata and is never serialized into a rollout.
+    pub(crate) item_id: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -181,6 +184,11 @@ fn user_message_element_style(style: Style, accent: Color) -> Style {
 }
 
 impl UserHistoryCell {
+    pub(crate) fn with_item_id(self, item_id: String) -> Self {
+        let _ = self.item_id.set(item_id);
+        self
+    }
+
     pub(crate) fn with_async_replies(
         mut self,
         replies: Vec<AsyncQuestionReply>,
@@ -814,6 +822,7 @@ pub(crate) fn new_user_prompt(
         local_image_paths,
         remote_image_urls,
         presentation: UserMessagePresentation::Plain,
+        item_id: Default::default(),
     }
 }
 

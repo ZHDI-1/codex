@@ -731,20 +731,7 @@ impl App {
             return Ok(());
         }
 
-        let width = self.chat_widget.history_wrap_width(screen_size.width);
-        let key = ReflowKey {
-            width,
-            terminal_width: screen_size.width,
-            row_cap: self.resize_reflow_max_rows(),
-            mode: self.chat_widget.history_render_mode(),
-            theme_revision: crate::render::highlight::syntax_theme_revision(),
-            terminal_fg: crate::terminal_palette::default_fg(),
-            terminal_bg: crate::terminal_palette::default_bg(),
-            color_level: crate::terminal_palette::stdout_color_level(),
-            wrap_policy: self.history_line_wrap_policy(),
-            older_history: self.scrollback_has_older_history,
-            notice: self.reflow_notice_text(),
-        };
+        let key = self.reflow_key(screen_size.into());
         let prepared = self.background_reflow.prepare(
             self.native_history.replayable_cells(&self.transcript_cells),
             key,
@@ -784,6 +771,22 @@ impl App {
         tui.schedule_screen_size_recheck(TRANSCRIPT_REFLOW_DEBOUNCE);
 
         Ok(())
+    }
+
+    fn reflow_key(&self, terminal_width: TerminalWidth) -> ReflowKey {
+        ReflowKey {
+            width: self.chat_widget.history_wrap_width(terminal_width.0),
+            terminal_width: terminal_width.0,
+            row_cap: self.resize_reflow_max_rows(),
+            mode: self.chat_widget.history_render_mode(),
+            theme_revision: crate::render::highlight::syntax_theme_revision(),
+            terminal_fg: crate::terminal_palette::default_fg(),
+            terminal_bg: crate::terminal_palette::default_bg(),
+            color_level: crate::terminal_palette::stdout_color_level(),
+            wrap_policy: self.history_line_wrap_policy(),
+            older_history: self.scrollback_has_older_history,
+            notice: self.reflow_notice_text(),
+        }
     }
 
     pub(super) fn reflow_transcript_now(
@@ -897,37 +900,37 @@ impl App {
         &mut self,
         tui: &mut tui::Tui,
         terminal_width: TerminalWidth,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if tui.is_owned_screen() {
             self.discard_scrollback_render_work(tui);
             tui.frame_requester().schedule_frame();
-            return Ok(());
+            return Ok(true);
         }
         self.native_history.replayed();
-        let width = self.chat_widget.history_wrap_width(terminal_width.0);
-        let reflowed_lines = if self.transcript_cells.is_empty() {
+        let result = if self.transcript_cells.is_empty() {
             self.reset_history_emission_state();
-            Vec::new()
+            ReflowRenderResult::default()
         } else {
-            self.render_transcript_lines_for_reflow(width).lines
+            match self.background_reflow.prepare(
+                self.native_history.replayable_cells(&self.transcript_cells),
+                self.reflow_key(terminal_width),
+                &self.app_event_tx,
+            ) {
+                PreparedReflow::Pending => return Ok(false),
+                PreparedReflow::Ready(result) => result,
+                PreparedReflow::Synchronous => self.render_transcript_lines_for_reflow(
+                    self.chat_widget.history_wrap_width(terminal_width.0),
+                ),
+            }
         };
-
-        tui.clear_pending_history_lines();
-        self.clear_terminal_for_resize_replay(tui)?;
-
-        self.deferred_history_lines.clear();
-        if !reflowed_lines.is_empty() {
-            tui.insert_history_hyperlink_lines_with_wrap_policy(
-                reflowed_lines,
-                self.history_line_wrap_policy(),
-            );
-        }
-
-        Ok(())
+        self.apply_reflow_render(tui, terminal_width, result)?;
+        self.transcript_reflow.clear_pending_reflow();
+        self.transcript_reflow.mark_reflowed_width(terminal_width.0);
+        Ok(true)
     }
 
     /// Discard terminal render products while preserving the canonical cells and view position.
-    fn discard_scrollback_render_work(&mut self, tui: &mut tui::Tui) {
+    pub(super) fn discard_scrollback_render_work(&mut self, tui: &mut tui::Tui) {
         self.background_reflow.clear();
         self.transcript_reflow.clear_pending_reflow();
         self.transcript_reflow.clear_stream_flags();
