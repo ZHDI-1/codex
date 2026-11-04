@@ -121,7 +121,8 @@ on GitHub. To return to upstream, use the official installer for both package ro
 restart the daemon. Keep the saved old selections until the first cutover is verified.
 
 Both Linux architectures run scoped history/cache/reflow, daemon install/updater, and
-install-context regressions. macOS runs install-context tests and type-checks the TUI test
+install-context regressions, including prompt editing, backtracking, and native history replay.
+macOS runs install-context tests and type-checks the TUI test
 suite without linking its large test binary. Every platform executes the packaged native
 binaries, verifies CLI and daemon installations in temporary homes, and checks its symbols.
 The planner also tests bootstrap behavior, source-bundle restoration, release assembly, and

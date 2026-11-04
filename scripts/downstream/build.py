@@ -103,6 +103,7 @@ def build(root, dist, target, phase):
             run(*test, "-p", "codex-tui", "--lib", "--",
                 "app_server_session::history::tests", "history_render::tests",
                 "render::highlight_cache::tests", "resize_reflow", "insert_history",
+                "prompt_edit", "backtrack", "native_history",
                 "update_versions", "update_action", "updates_cache", cwd=rust)
 
     if phase in ("all", "package"):
