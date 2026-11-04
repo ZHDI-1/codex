@@ -579,6 +579,7 @@ pub(crate) struct App {
     pub(crate) deferred_history_lines: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
     has_emitted_history_lines: bool,
     transcript_reflow: TranscriptReflowState,
+    background_reflow: resize_reflow::BackgroundReflow,
     initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
     pending_thread_switch_resets: usize,
     pub(crate) scrollback_has_older_history: bool,
@@ -1169,8 +1170,8 @@ impl App {
                 }
                 TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                     if self.backtrack_render_pending && !tui.is_owned_screen() {
-                        self.rebuild_transcript_after_backtrack(tui, screen_size.into())?;
-                        self.backtrack_render_pending = false;
+                        self.backtrack_render_pending =
+                            !self.rebuild_transcript_after_backtrack(tui, screen_size.into())?;
                     }
                     self.chat_widget.maybe_post_pending_notification(tui);
                     if self

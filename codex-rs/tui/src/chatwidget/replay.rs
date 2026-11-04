@@ -280,7 +280,9 @@ impl ChatWidget {
         let replay_kind = render_source.replay_kind();
         match item {
             ThreadItemPayload::UserMessage {
-                content, client_id, ..
+                id,
+                content,
+                client_id,
             } => {
                 if let Some(replies) = crate::async_question_reply::parse_input(&content) {
                     let ids = replies
@@ -295,12 +297,23 @@ impl ChatWidget {
                     self.refresh_pending_input_preview();
                     self.request_redraw();
                 }
+                let previous_prompt = self.last_rendered_user_prompt_item_id.clone();
                 self.on_committed_user_message(
                     &content,
                     client_id.as_deref(),
                     from_replay,
                     &turn_id,
                 );
+                if let Some(prompt) = &self.last_rendered_user_prompt_item_id {
+                    let newly_displayed = previous_prompt
+                        .as_ref()
+                        .is_none_or(|previous| !Arc::ptr_eq(previous, prompt));
+                    let acknowledged_submission = client_id.is_some()
+                        && client_id == self.last_rendered_user_message_client_id;
+                    if newly_displayed || acknowledged_submission {
+                        let _ = prompt.set(id);
+                    }
+                }
             }
             ThreadItemPayload::AgentMessage {
                 id,

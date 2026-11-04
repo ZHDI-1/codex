@@ -137,6 +137,80 @@ pub(crate) struct ThreadHistoryPagination {
 }
 
 impl AppServerSession {
+    /// Validate a displayed prompt without downloading the tool-heavy history window again.
+    /// Turn metadata guards the same tail identity as the full-history path. Reading the
+    /// selected turn from its beginning proves that this item is not a mid-turn steer.
+    pub(crate) async fn prompt_edit_turn(
+        &mut self,
+        thread_id: ThreadId,
+        turn_id: &str,
+        item_id: &str,
+        expected_latest_turn_id: Option<&str>,
+    ) -> Result<Turn> {
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        let mut turn = loop {
+            let page = self
+                .thread_turns_page(thread_id, cursor.clone(), HISTORY_ITEM_PAGE_LIMIT)
+                .await?;
+            if cursor.is_none()
+                && page.data.first().map(|turn| turn.id.as_str()) != expected_latest_turn_id
+            {
+                color_eyre::eyre::bail!(
+                    "thread history changed; reload the session before editing this prompt"
+                );
+            }
+            if let Some(turn) = page.data.into_iter().find(|turn| turn.id == turn_id) {
+                break turn;
+            }
+            cursor = advancing_cursor(cursor.as_deref(), page.next_cursor, &mut seen);
+            if cursor.is_none() {
+                color_eyre::eyre::bail!("the selected turn no longer exists");
+            }
+        };
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        loop {
+            let request_id = self.next_request_id();
+            let page: ThreadItemsListResponse = self
+                .client
+                .request_typed(ClientRequest::ThreadItemsList {
+                    request_id,
+                    params: ThreadItemsListParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: Some(turn_id.to_string()),
+                        cursor: cursor.clone().map(ThreadItemsListCursor::Opaque),
+                        // The normal first item is the prompt: avoid transferring any tool
+                        // output at all. Unusual leading items continue in bounded pages.
+                        limit: Some(if cursor.is_none() {
+                            1
+                        } else {
+                            HISTORY_ITEM_PAGE_LIMIT
+                        }),
+                        sort_direction: Some(SortDirection::Asc),
+                    },
+                })
+                .await?;
+            for entry in page.data {
+                if matches!(&entry.item.payload, ThreadItemPayload::UserMessage { .. }) {
+                    if entry.item.id() != item_id {
+                        color_eyre::eyre::bail!(
+                            "the selected prompt is a steer and cannot be edited independently"
+                        );
+                    }
+                    turn.items = vec![entry.item];
+                    return Ok(turn);
+                }
+            }
+            cursor = advancing_cursor(cursor.as_deref(), page.next_cursor, &mut seen);
+            if cursor.is_none() {
+                color_eyre::eyre::bail!(
+                    "the selected prompt was not found in the persisted thread"
+                );
+            }
+        }
+    }
+
     pub(crate) async fn revert_thread(
         &mut self,
         thread_id: ThreadId,
@@ -382,7 +456,11 @@ impl AppServerSession {
             {
                 break;
             }
-            if let Some((config, local_settings)) = config.zip(local_settings) {
+            // Height measurement renders and highlights the page. An uncapped load has no row
+            // budget to satisfy, so leave formatting to the eventual parallel transcript render.
+            if budget.rows.is_some()
+                && let Some((config, local_settings)) = config.zip(local_settings)
+            {
                 rendered_rows = rendered_history_rows(
                     thread_id,
                     thread,
@@ -425,18 +503,35 @@ fn rendered_history_rows(
     } else {
         HistoryRenderMode::Rich
     };
-    thread_items_to_transcript_cells(
+    let cells = thread_items_to_transcript_cells(
         Some(thread_id),
         &thread.cwd,
         items,
         visibility,
         Some(config),
-    )
-    .into_iter()
-    .fold(rendered_rows, |rows, cell| {
-        let height = usize::from(cell.desired_height_for_mode(width, mode));
-        rows + height + usize::from(height != 0 && rows != 0 && !cell.is_stream_continuation())
-    })
+    );
+    rendered_cell_rows(&cells, width, mode, rendered_rows)
+}
+
+fn rendered_cell_rows(
+    cells: &[std::sync::Arc<dyn crate::history_cell::HistoryCell>],
+    width: u16,
+    mode: HistoryRenderMode,
+    rendered_rows: usize,
+) -> usize {
+    let heights = crate::history_render::map_cells(cells, |cell| {
+        (
+            usize::from(cell.desired_height_for_mode(width, mode)),
+            cell.is_stream_continuation(),
+        )
+    });
+    // Keep accounting ordered: empty cells add no separator, the first visible cell has
+    // no leading separator, and a continuation never starts a new separated block.
+    heights
+        .into_iter()
+        .fold(rendered_rows, |rows, (height, continuation)| {
+            rows + height + usize::from(height != 0 && rows != 0 && !continuation)
+        })
 }
 
 #[cfg(test)]

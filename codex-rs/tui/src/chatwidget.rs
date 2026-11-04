@@ -797,6 +797,7 @@ pub(crate) struct ChatWidget {
     external_editor_state: ExternalEditorState,
     last_rendered_user_message_display: Option<UserMessageDisplay>,
     last_rendered_user_message_client_id: Option<String>,
+    last_rendered_user_prompt_item_id: Option<Arc<std::sync::OnceLock<String>>>,
     last_non_retry_error: Option<(String, String)>,
     // Keep fixture storage alive until all other widget fields have been dropped.
     #[cfg(test)]
@@ -1264,6 +1265,9 @@ impl ChatWidget {
         &mut self,
         cell: &dyn HistoryCell,
     ) -> Option<Box<dyn HistoryCell>> {
+        // Nothing can be flushed without an active cell. In particular, do not highlight and
+        // wrap every incoming replay cell merely to establish that there is no prefix to emit.
+        self.transcript.active_cell.as_ref()?;
         // Keep the placeholder session header as the active cell until real session info arrives,
         // so we can merge headers instead of committing a duplicate box to history.
         let keep_placeholder_header_active = !self.is_session_configured()
@@ -1415,15 +1419,15 @@ impl ChatWidget {
             || !display.local_images.is_empty()
             || !display.remote_image_urls.is_empty()
         {
-            self.add_to_history(
-                history_cell::new_user_prompt(
-                    display.message,
-                    display.text_elements,
-                    display.local_images,
-                    display.remote_image_urls,
-                )
-                .with_async_replies(display.replies, self.config.cwd.as_path()),
-            );
+            let cell = history_cell::new_user_prompt(
+                display.message,
+                display.text_elements,
+                display.local_images,
+                display.remote_image_urls,
+            )
+            .with_async_replies(display.replies, self.config.cwd.as_path());
+            self.last_rendered_user_prompt_item_id = Some(Arc::clone(&cell.item_id));
+            self.add_to_history(cell);
         }
     }
 

@@ -1,12 +1,193 @@
 use super::HistoryHydrationScope;
 use super::HistoryLoadBudget;
 use super::advancing_cursor;
+use super::rendered_cell_rows;
+use crate::history_cell::HistoryCell;
+use crate::history_cell::HistoryRenderMode;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::TerminalResizeReflowMaxRows;
 use crate::local_settings::LocalSettings;
 use codex_config::types::AltScreenMode;
 use pretty_assertions::assert_eq;
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+#[tokio::test]
+async fn prompt_edit_reads_only_the_selected_prompt_and_rejects_stale_or_steered_selections()
+-> color_eyre::Result<()> {
+    use crate::app_server_session::AppServerSession;
+    use crate::app_server_session::ThreadParamsMode;
+    use codex_app_server_protocol::JSONRPCMessage;
+    use codex_protocol::ThreadId;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for (latest, first_item, error) in [
+        ("selected-turn", "selected-item", None),
+        (
+            "changed-turn",
+            "selected-item",
+            Some("thread history changed"),
+        ),
+        ("selected-turn", "earlier-input", Some("steer")),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            let mut requests = Vec::new();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else {
+                    continue;
+                };
+                let mut reply = match request.method.as_str() {
+                    "initialize" => json!({"result": {"userAgent": "prompt-edit-test/1.0"}}),
+                    "thread/turns/list" => {
+                        requests.push((request.method, request.params.unwrap()));
+                        json!({"result": {"data": [{
+                            "id": latest, "items": [], "status": "completed"
+                        }], "nextCursor": null, "backwardsCursor": null}})
+                    }
+                    "thread/items/list" => {
+                        let params = request.params.unwrap();
+                        assert_eq!(params["turnId"], "selected-turn");
+                        assert_eq!(params["sortDirection"], "asc");
+                        assert_eq!(params["limit"], 1);
+                        requests.push((request.method, params));
+                        json!({"result": {"data": [{
+                            "turnId": "selected-turn", "item": {
+                                "type": "userMessage", "id": first_item,
+                                "content": [{"type": "text", "text": "selected prompt", "textElements": []}]
+                            }
+                        }], "nextCursor": null, "backwardsCursor": null}})
+                    }
+                    method => panic!("unexpected prompt-edit request: {method}"),
+                };
+                reply["id"] = json!(request.id);
+                socket.send(Message::Text(reply.to_string().into())).await?;
+            }
+            Ok::<_, color_eyre::Report>(requests)
+        });
+        let mut session = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            crate::connect_remote_app_server(endpoint).await?,
+            ThreadParamsMode::Embedded,
+        );
+        let result = session
+            .prompt_edit_turn(
+                ThreadId::new(),
+                "selected-turn",
+                "selected-item",
+                Some("selected-turn"),
+            )
+            .await;
+        if let Some(error) = error {
+            assert!(format!("{:#}", result.unwrap_err()).contains(error));
+        } else {
+            let turn = result?;
+            assert_eq!(turn.id, "selected-turn");
+            assert_eq!(turn.items.len(), 1);
+            assert_eq!(turn.items[0].id(), "selected-item");
+        }
+        session.shutdown().await?;
+        let requests = server.await??;
+        assert_eq!(requests.len(), if latest == "changed-turn" { 1 } else { 2 });
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HeightMeasuredCell {
+    height: u16,
+    continuation: bool,
+    calls: Arc<Mutex<Vec<(u16, HistoryRenderMode, String)>>>,
+}
+
+impl HistoryCell for HeightMeasuredCell {
+    fn raw_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+        unreachable!("height measurement should use the cell's mode-aware height")
+    }
+
+    fn display_lines(&self, _width: u16) -> Vec<ratatui::text::Line<'static>> {
+        unreachable!("height measurement should use the cell's mode-aware height")
+    }
+
+    fn desired_height_for_mode(&self, width: u16, mode: HistoryRenderMode) -> u16 {
+        self.calls.lock().unwrap().push((
+            width,
+            mode,
+            std::thread::current().name().unwrap_or("").to_owned(),
+        ));
+        self.height
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        self.continuation
+    }
+}
+
+#[test]
+fn parallel_page_heights_preserve_empty_cells_continuations_and_prior_rows() {
+    for mode in [HistoryRenderMode::Rich, HistoryRenderMode::Raw] {
+        for prior_rows in [0, 11] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let cells: Vec<Arc<dyn HistoryCell>> = (0..8)
+                .flat_map(|_| {
+                    [
+                        (0, false),
+                        (0, true),
+                        (2, false),
+                        (0, false),
+                        (3, true),
+                        (1, false),
+                        (0, true),
+                        (4, false),
+                    ]
+                })
+                .map(|(height, continuation)| {
+                    Arc::new(HeightMeasuredCell {
+                        height,
+                        continuation,
+                        calls: calls.clone(),
+                    }) as Arc<dyn HistoryCell>
+                })
+                .collect();
+            let rows = rendered_cell_rows(&cells, 74, mode, prior_rows);
+            // Eight groups each add ten content rows and three block separators;
+            // only an initially empty transcript omits its first separator.
+            assert_eq!(rows, prior_rows + 80 + 24 - usize::from(prior_rows == 0));
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 64);
+            assert!(calls.iter().all(|(width, actual_mode, thread)| {
+                *width == 74 && *actual_mode == mode && thread.starts_with("codex-history-")
+            }));
+        }
+    }
+}
+
+#[test]
+fn empty_and_small_pages_keep_height_accounting_without_worker_dispatch() {
+    assert_eq!(rendered_cell_rows(&[], 80, HistoryRenderMode::Rich, 11), 11);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(HeightMeasuredCell {
+        height: 3,
+        continuation: false,
+        calls: calls.clone(),
+    })];
+    assert_eq!(
+        rendered_cell_rows(&cells, 80, HistoryRenderMode::Raw, 11),
+        15
+    );
+    let current = std::thread::current();
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2, current.name().unwrap_or(""));
+}
 
 #[test]
 fn advancing_cursor_rejects_repeated_cursors() {
@@ -91,4 +272,26 @@ async fn owned_initial_history_stops_after_viewport_or_scan_budget() {
             [Some(30), None],
         );
     }
+}
+
+#[tokio::test]
+async fn uncapped_native_history_has_no_height_measurement_budget() {
+    let codex_home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .unwrap();
+    config.tui_fullscreen_transcript = false;
+    config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    let local_settings = LocalSettings::from(&config);
+    let budget = HistoryLoadBudget::new(
+        HistoryHydrationScope::Initial,
+        Some(&config),
+        Some(&local_settings),
+        24,
+    );
+    assert_eq!(budget.rows, None);
+    assert_eq!(budget.items, None);
+    assert_eq!(budget.next_page_size(100_000, 100_000), Some(100));
 }

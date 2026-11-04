@@ -59,6 +59,7 @@ async fn deprecation_delivery_deduplicates_retained_transcript() -> Result<()> {
     app.insert_history_cell(
         &mut tui,
         Box::new(UserHistoryCell {
+            item_id: Default::default(),
             message: "Hello\nPlease say hello.".into(),
             text_elements: Vec::new(),
             local_image_paths: Vec::new(),
@@ -144,6 +145,7 @@ async fn startup_warnings_preserve_stream_repair_and_backtrack_selection() -> Re
         app.config.cwd.to_path_buf(),
     ));
     app.transcript_cells = vec![Arc::new(UserHistoryCell {
+        item_id: Default::default(),
         message: "Selected prompt".into(),
         text_elements: Vec::new(),
         local_image_paths: Vec::new(),

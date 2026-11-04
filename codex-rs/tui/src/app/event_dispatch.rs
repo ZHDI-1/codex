@@ -94,6 +94,7 @@ impl App {
                     | AppEvent::BeginInitialHistoryReplayBuffer
                     | AppEvent::BeginThreadSwitchHistoryReplayBuffer
                     | AppEvent::EndInitialHistoryReplayBuffer
+                    | AppEvent::HistoryReflowReady { .. }
                     | AppEvent::FatalExitRequest(_)
             )
         {
@@ -724,18 +725,53 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 };
                 let nth_user_message = crate::app_backtrack::user_count(&self.transcript_cells[..index]);
+                let selected_item_id = selected_cell.as_any()
+                    .downcast_ref::<crate::history_cell::UserHistoryCell>()
+                    .and_then(|cell| cell.item_id.get()).cloned();
+                let lookup_started = Instant::now();
                 let selection: Result<(String, Vec<Turn>)> = async {
                     let channel = self.thread_event_channels.get(&thread_id)
                         .ok_or_else(|| color_eyre::eyre::eyre!("the selected thread is no longer available"))?;
-                    let (start_item, loaded_tail, latest_turn_id) = {
+                    let (start_item, loaded_tail, latest_turn_id, cached) = {
                         let store = channel.store.lock().await;
+                        let start_item = store.turns.iter().find_map(|turn| turn.items.first()
+                            .map(|item| (turn.id.clone(), item.id().to_string())));
+                        let cached = selected_item_id.as_ref().and_then(|item_id| {
+                            // Also check visible ordering: a bounded snapshot may no longer
+                            // contain a displayed live prompt, and item IDs need not be unique
+                            // across turns imported from older history.
+                            let mut cached_prompt = prompt.clone();
+                            let turn_id = crate::app_backtrack::backtrack_revert_before_turn_id(
+                                &store.turns, start_item.as_ref(), nth_user_message,
+                                &mut cached_prompt,
+                            ).ok()?;
+                            let cut = store.turns.iter().position(|turn| turn.id == turn_id)?;
+                            store.turns[cut].items.iter().any(|item| item.id() == item_id)
+                                .then(|| (turn_id, store.turns[..cut].to_vec()))
+                        });
                         (
-                            store.turns.iter().find_map(|turn| turn.items.first()
-                                .map(|item| (turn.id.clone(), item.id().to_string()))),
+                            start_item,
                             store.turns.last().map(|turn| turn.id.clone()),
                             store.latest_turn_id.clone(),
+                            cached,
                         )
                     };
+                    if let Some((turn_id, retained_turns)) = cached {
+                        let turn = app_server.prompt_edit_turn(
+                            thread_id, &turn_id,
+                            selected_item_id.as_deref().expect("cached prompt has an item ID"),
+                            latest_turn_id.as_deref(),
+                        ).await?;
+                        let before_turn_id = crate::app_backtrack::backtrack_revert_before_turn_id(
+                            std::slice::from_ref(&turn), /*start_item*/ None,
+                            /*nth_user_message*/ 0, &mut prompt,
+                        )?;
+                        tracing::debug!(%thread_id, elapsed_ms = lookup_started.elapsed().as_millis(),
+                            "resolved prompt edit from cached history");
+                        return Ok((before_turn_id, retained_turns));
+                    }
+                    // A displayed live prompt can outlive its bounded replay-buffer records.
+                    // Preserve the authoritative reload for that case and legacy cells without IDs.
                     let mut thread = app_server.thread_read(thread_id, /*include_turns*/ false).await?;
                     app_server.hydrate_initial_thread_history(
                         &mut thread,
@@ -779,6 +815,8 @@ impl App {
                             turn.items.clear();
                         }
                     }
+                    tracing::debug!(%thread_id, elapsed_ms = lookup_started.elapsed().as_millis(),
+                        "resolved prompt edit by reloading history");
                     Ok((before_turn_id, thread.turns))
                 }.await;
                 let (before_turn_id, retained_turns) = match selection {
@@ -876,6 +914,7 @@ impl App {
                     self.last_rendered_history_tail = None;
                     self.last_thread_usage_status_cell = None;
                     self.pending_thread_usage_history_refresh = false;
+                    self.discard_scrollback_render_work(tui);
                     self.backtrack_render_pending = !tui.is_owned_screen();
                     self.chat_widget.set_queue_autosend_suppressed(/*suppressed*/ false);
                     self.chat_widget.emit_prompt_edit_thread_event();
@@ -884,6 +923,11 @@ impl App {
             }
             AppEvent::BeginInitialHistoryReplayBuffer => {
                 self.begin_initial_history_replay_buffer();
+            }
+            AppEvent::HistoryReflowReady { id } => {
+                if self.background_reflow.is_current(id) {
+                    tui.frame_requester().schedule_frame();
+                }
             }
             AppEvent::BeginThreadSwitchHistoryReplayBuffer => {
                 self.begin_thread_switch_history_replay_buffer();

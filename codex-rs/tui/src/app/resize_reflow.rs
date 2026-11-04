@@ -10,15 +10,19 @@
 //! before consolidation is marked as stream-time work so consolidation can force one final rebuild
 //! from the finalized source.
 //!
-//! The row cap is enforced while rendering from `HistoryCell` source, not after writing to the
-//! terminal. Initial resume replay uses the same display-line buffering contract so large sessions
-//! do not write more retained rows than resize replay would later be willing to rebuild.
+//! Initial replay defers formatting until its cells are collected. Large snapshots render on a
+//! bounded CPU pool; only the UI validates and emits their results. Width, source identity, theme,
+//! and terminal colors must still match when work finishes. A row cap bounds the tail being rebuilt.
 //!
 //! Owned-screen sessions lay out their retained transcript during drawing. Their entry points drop
 //! queued scrollback work and request a frame instead of clearing or replaying terminal history.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use color_eyre::eyre::Result;
@@ -30,6 +34,7 @@ use super::App;
 use super::InitialHistoryReplayBuffer;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::HistoryRenderMode;
 use crate::insert_history::HistoryLineWrapPolicy;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::transcript_reflow::TRANSCRIPT_REFLOW_DEBOUNCE;
@@ -55,8 +60,243 @@ struct ReflowCellDisplay {
 /// This is intentionally line-oriented rather than cell-oriented because the terminal only accepts
 /// already-wrapped rows. Callers should keep treating `transcript_cells` as the source of truth; the
 /// rows here are a transient render product for a single terminal width.
+#[derive(Default)]
 pub(super) struct ReflowRenderResult {
     pub(super) lines: Vec<HyperlinkLine>,
+    history_was_truncated: bool,
+    prepared: Option<crate::insert_history::PreparedHistory>,
+}
+
+const BACKGROUND_REFLOW_MIN_CELLS: usize = 32;
+
+#[derive(Clone, Eq, PartialEq)]
+struct ReflowKey {
+    width: u16,
+    terminal_width: u16,
+    row_cap: Option<usize>,
+    mode: HistoryRenderMode,
+    theme_revision: u64,
+    terminal_fg: Option<(u8, u8, u8)>,
+    terminal_bg: Option<(u8, u8, u8)>,
+    color_level: crate::terminal_palette::StdoutColorLevel,
+    wrap_policy: HistoryLineWrapPolicy,
+    older_history: bool,
+    notice: Option<Arc<str>>,
+}
+
+struct ReflowJob {
+    id: u64,
+    key: ReflowKey,
+    sources: Vec<Weak<dyn HistoryCell>>,
+    cancelled: Arc<AtomicBool>,
+    result: mpsc::Receiver<std::thread::Result<std::io::Result<Option<ReflowRenderResult>>>>,
+}
+
+#[derive(Default)]
+pub(super) struct BackgroundReflow {
+    next_id: u64,
+    job: Option<ReflowJob>,
+    unavailable: bool,
+}
+
+enum PreparedReflow {
+    Pending,
+    Ready(ReflowRenderResult),
+    Synchronous,
+}
+
+impl Drop for BackgroundReflow {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+impl BackgroundReflow {
+    pub(super) fn invalidate(&mut self) {
+        if let Some(job) = &self.job {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn is_current(&self, id: u64) -> bool {
+        self.job.as_ref().is_some_and(|job| job.id == id)
+    }
+
+    fn prepare(
+        &mut self,
+        sources: &[Arc<dyn HistoryCell>],
+        key: ReflowKey,
+        events: &crate::app_event_sender::AppEventSender,
+    ) -> PreparedReflow {
+        if sources.len() < BACKGROUND_REFLOW_MIN_CELLS || self.unavailable {
+            self.clear();
+            return PreparedReflow::Synchronous;
+        }
+        if let Some(job) = &self.job {
+            let matches = !job.cancelled.load(Ordering::Relaxed)
+                && job.key == key
+                && job.sources.len() == sources.len()
+                && job
+                    .sources
+                    .iter()
+                    .zip(sources)
+                    .all(|(old, current)| old.ptr_eq(&Arc::downgrade(current)));
+            if !matches {
+                job.cancelled.store(true, Ordering::Relaxed);
+            }
+            // Keep at most one in-flight request per app. A later resize supersedes it rather
+            // than queueing another full copy of the transcript on every draw.
+            match job.result.try_recv() {
+                Ok(Ok(Ok(Some(result)))) if matches => {
+                    self.job = None;
+                    return PreparedReflow::Ready(result);
+                }
+                Ok(Ok(Ok(_))) => self.job = None,
+                Ok(Err(_)) | Ok(Ok(Err(_))) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.job = None;
+                    self.unavailable = true;
+                    tracing::warn!(
+                        "background history rendering failed; using synchronous rendering"
+                    );
+                    return PreparedReflow::Synchronous;
+                }
+                Err(mpsc::TryRecvError::Empty) => return PreparedReflow::Pending,
+            }
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_id;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (sender, result) = mpsc::channel();
+        let weak_sources = sources.iter().map(Arc::downgrade).collect();
+        let sources = sources.to_vec();
+        let worker_cancelled = cancelled.clone();
+        let events = events.clone();
+        let worker_key = key.clone();
+        let spawned = crate::history_render::spawn(move || {
+            let rendered =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> std::io::Result<_> {
+                    let Some(mut result) = render_reflow_cells(
+                        &sources,
+                        worker_key.width,
+                        worker_key.mode,
+                        worker_key.row_cap,
+                        &worker_cancelled,
+                    ) else {
+                        return Ok(None);
+                    };
+                    prepend_history_notice(
+                        &mut result.lines,
+                        result.history_was_truncated,
+                        worker_key.width,
+                        worker_key.row_cap,
+                        worker_key.older_history,
+                        worker_key.notice.as_deref(),
+                    );
+                    if worker_cancelled.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    result.prepared = Some(crate::insert_history::prepare_history_hyperlink_lines(
+                        std::mem::take(&mut result.lines),
+                        worker_key.terminal_width,
+                        worker_key.wrap_policy,
+                    )?);
+                    Ok((!worker_cancelled.load(Ordering::Relaxed)).then_some(result))
+                }));
+            let _ = sender.send(rendered);
+            events.send(crate::app_event::AppEvent::HistoryReflowReady { id });
+        });
+        if !spawned {
+            self.unavailable = true;
+            return PreparedReflow::Synchronous;
+        }
+        self.job = Some(ReflowJob {
+            id,
+            key,
+            sources: weak_sources,
+            cancelled,
+            result,
+        });
+        PreparedReflow::Pending
+    }
+}
+
+fn render_reflow_cells(
+    cells: &[Arc<dyn HistoryCell>],
+    width: u16,
+    mode: HistoryRenderMode,
+    row_cap: Option<usize>,
+    cancelled: &AtomicBool,
+) -> Option<ReflowRenderResult> {
+    let rendered = crate::history_render::render_tail(cells, row_cap, cancelled, |cell| {
+        let lines = cell.display_hyperlink_lines_for_mode(width, mode);
+        crate::history_render::Rendered {
+            rows: lines.len(),
+            continuation: cell.is_stream_continuation(),
+            value: ReflowCellDisplay {
+                lines,
+                is_stream_continuation: cell.is_stream_continuation(),
+            },
+        }
+    })?;
+    let mut lines = Vec::new();
+    let mut emitted = false;
+    for display in rendered.cells {
+        if !display.lines.is_empty() && !display.is_stream_continuation {
+            if emitted {
+                lines.push(HyperlinkLine::new(Line::from("")));
+            }
+            emitted = true;
+        }
+        lines.extend(display.lines);
+    }
+    let mut history_was_truncated = rendered.truncated;
+    if let Some(cap) = row_cap
+        && lines.len() > cap
+    {
+        history_was_truncated = true;
+        lines = lines.split_off(lines.len() - cap);
+    }
+    Some(ReflowRenderResult {
+        lines,
+        history_was_truncated,
+        prepared: None,
+    })
+}
+
+fn prepend_history_notice(
+    lines: &mut Vec<HyperlinkLine>,
+    history_was_truncated: bool,
+    width: u16,
+    max_rows: Option<usize>,
+    older_history: bool,
+    notice: Option<&str>,
+) {
+    if lines.is_empty() || (!history_was_truncated && !older_history) {
+        return;
+    }
+    let Some(notice) = notice else {
+        return;
+    };
+    let notice_lines = crate::wrapping::word_wrap_lines(
+        [Line::from(notice.to_owned()).dim()],
+        usize::from(width.max(1)),
+    );
+    if let Some(max_rows) = max_rows {
+        let available_history_rows = max_rows.saturating_sub(notice_lines.len());
+        if available_history_rows == 0 {
+            return;
+        }
+        if lines.len() > available_history_rows {
+            lines.drain(..lines.len() - available_history_rows);
+        }
+    }
+    lines.splice(0..0, notice_lines.into_iter().map(HyperlinkLine::new));
 }
 
 pub(super) fn trailing_run_start<T: 'static>(transcript_cells: &[Arc<dyn HistoryCell>]) -> usize {
@@ -128,25 +368,27 @@ impl App {
         }
     }
 
-    /// Start retaining initial resume replay rows before they are written to scrollback.
+    /// Defer initial resume formatting until all replay cells have been collected.
     ///
     /// Resume replay can insert thousands of already-finalized history cells before the first draw.
-    /// Buffering here lets the same row cap used by resize rebuilds apply to the startup write.
+    /// Deferring lets startup use the parallel resize renderer and its row cap.
     /// Starting this buffer while an overlay owns rendering would split transcript ownership, so
     /// overlay replay continues through the normal deferred-history path.
     pub(super) fn begin_initial_history_replay_buffer(&mut self) {
         if self.overlay.is_none() {
-            self.initial_history_replay_buffer = Some(Default::default());
+            self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
+                render_from_transcript_tail: true,
+                ..Default::default()
+            });
         }
     }
 
     /// Start retaining a thread-switch transcript replay without rendering each historical cell.
     ///
-    /// Thread switches already rebuild `transcript_cells` from source. When a row cap exists, we can
-    /// defer terminal writes until the replay is complete and reuse the resize-reflow tail renderer
-    /// so only the rows the terminal would retain are formatted and inserted.
+    /// Defer formatting until replay completes so large uncapped histories also use the background
+    /// renderer. With a row cap, the same path additionally avoids formatting the full backlog.
     pub(super) fn begin_thread_switch_history_replay_buffer(&mut self) {
-        if self.resize_reflow_max_rows().is_some() && self.overlay.is_none() {
+        if self.overlay.is_none() {
             self.initial_history_replay_buffer = Some(InitialHistoryReplayBuffer {
                 retained_lines: VecDeque::new(),
                 render_from_transcript_tail: true,
@@ -157,9 +399,8 @@ impl App {
 
     /// Flush retained initial resume replay rows into terminal scrollback.
     ///
-    /// The buffer stores display lines, not cells, because the cap is measured in terminal rows.
-    /// This mirrors terminal scrollback behavior and avoids making startup replay cheaper or more
-    /// expensive than a later resize rebuild of the same transcript.
+    /// Source-backed replay schedules one reflow after the replay barrier. Any already-retained
+    /// display rows are otherwise flushed with the same terminal row limit.
     pub(super) fn finish_initial_history_replay_buffer(&mut self, tui: &mut tui::Tui) {
         let Some(buffer) = self.initial_history_replay_buffer.take() else {
             return;
@@ -267,6 +508,7 @@ impl App {
     }
 
     fn schedule_resize_reflow(&mut self, target_width: Option<u16>) -> bool {
+        self.background_reflow.invalidate();
         self.transcript_reflow.schedule_debounced(target_width)
     }
 
@@ -330,6 +572,7 @@ impl App {
     }
 
     pub(super) fn schedule_immediate_resize_reflow(&mut self, tui: &mut tui::Tui) {
+        self.background_reflow.invalidate();
         if tui.is_owned_screen() {
             self.discard_scrollback_render_work(tui);
         } else {
@@ -488,6 +731,16 @@ impl App {
             return Ok(());
         }
 
+        let key = self.reflow_key(screen_size.into());
+        let prepared = self.background_reflow.prepare(
+            self.native_history.replayable_cells(&self.transcript_cells),
+            key,
+            &self.app_event_tx,
+        );
+        if matches!(&prepared, PreparedReflow::Pending) {
+            return Ok(());
+        }
+
         self.transcript_reflow.clear_pending_reflow();
 
         // Track that a reflow happened during an active stream or while trailing
@@ -496,7 +749,17 @@ impl App {
         let reflow_ran_during_stream =
             !self.transcript_cells.is_empty() && self.should_mark_reflow_as_stream_time();
 
-        let width = self.reflow_transcript_now(tui, screen_size.into())?;
+        let width = match prepared {
+            PreparedReflow::Ready(result) => {
+                self.has_emitted_history_lines = result
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|prepared| !prepared.source.is_empty());
+                self.apply_reflow_render(tui, screen_size.into(), result)?
+            }
+            PreparedReflow::Synchronous => self.reflow_transcript_now(tui, screen_size.into())?,
+            PreparedReflow::Pending => unreachable!(),
+        };
         self.transcript_reflow.mark_reflowed_width(width.0);
 
         if reflow_ran_during_stream {
@@ -508,6 +771,22 @@ impl App {
         tui.schedule_screen_size_recheck(TRANSCRIPT_REFLOW_DEBOUNCE);
 
         Ok(())
+    }
+
+    fn reflow_key(&self, terminal_width: TerminalWidth) -> ReflowKey {
+        ReflowKey {
+            width: self.chat_widget.history_wrap_width(terminal_width.0),
+            terminal_width: terminal_width.0,
+            row_cap: self.resize_reflow_max_rows(),
+            mode: self.chat_widget.history_render_mode(),
+            theme_revision: crate::render::highlight::syntax_theme_revision(),
+            terminal_fg: crate::terminal_palette::default_fg(),
+            terminal_bg: crate::terminal_palette::default_bg(),
+            color_level: crate::terminal_palette::stdout_color_level(),
+            wrap_policy: self.history_line_wrap_policy(),
+            older_history: self.scrollback_has_older_history,
+            notice: self.reflow_notice_text(),
+        }
     }
 
     pub(super) fn reflow_transcript_now(
@@ -530,17 +809,32 @@ impl App {
 
         self.native_history.replayed();
         let reflow_result = self.render_transcript_lines_for_reflow(width);
-        let reflowed_lines = reflow_result.lines;
-        let reflowed_rows = reflowed_lines.len();
+        self.apply_reflow_render(tui, terminal_width, reflow_result)
+    }
+
+    fn apply_reflow_render(
+        &mut self,
+        tui: &mut tui::Tui,
+        terminal_width: TerminalWidth,
+        reflow_result: ReflowRenderResult,
+    ) -> Result<TerminalWidth> {
+        self.native_history.replayed();
+        let width = self.chat_widget.history_wrap_width(terminal_width.0);
+        let reflowed_rows = reflow_result.prepared.as_ref().map_or_else(
+            || reflow_result.lines.len(),
+            |prepared| prepared.source.len(),
+        );
 
         // Drop any queued pre-resize/pre-consolidation inserts before rebuilding from cells.
         tui.clear_pending_history_lines();
         self.clear_terminal_for_resize_replay(tui)?;
 
         self.deferred_history_lines.clear();
-        if !reflowed_lines.is_empty() {
+        if let Some(prepared) = reflow_result.prepared {
+            tui.insert_prepared_history(prepared, self.history_line_wrap_policy());
+        } else if !reflow_result.lines.is_empty() {
             tui.insert_history_hyperlink_lines_with_wrap_policy(
-                reflowed_lines,
+                reflow_result.lines,
                 self.history_line_wrap_policy(),
             );
         }
@@ -606,37 +900,38 @@ impl App {
         &mut self,
         tui: &mut tui::Tui,
         terminal_width: TerminalWidth,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if tui.is_owned_screen() {
             self.discard_scrollback_render_work(tui);
             tui.frame_requester().schedule_frame();
-            return Ok(());
+            return Ok(true);
         }
         self.native_history.replayed();
-        let width = self.chat_widget.history_wrap_width(terminal_width.0);
-        let reflowed_lines = if self.transcript_cells.is_empty() {
+        let result = if self.transcript_cells.is_empty() {
             self.reset_history_emission_state();
-            Vec::new()
+            ReflowRenderResult::default()
         } else {
-            self.render_transcript_lines_for_reflow(width).lines
+            match self.background_reflow.prepare(
+                self.native_history.replayable_cells(&self.transcript_cells),
+                self.reflow_key(terminal_width),
+                &self.app_event_tx,
+            ) {
+                PreparedReflow::Pending => return Ok(false),
+                PreparedReflow::Ready(result) => result,
+                PreparedReflow::Synchronous => self.render_transcript_lines_for_reflow(
+                    self.chat_widget.history_wrap_width(terminal_width.0),
+                ),
+            }
         };
-
-        tui.clear_pending_history_lines();
-        self.clear_terminal_for_resize_replay(tui)?;
-
-        self.deferred_history_lines.clear();
-        if !reflowed_lines.is_empty() {
-            tui.insert_history_hyperlink_lines_with_wrap_policy(
-                reflowed_lines,
-                self.history_line_wrap_policy(),
-            );
-        }
-
-        Ok(())
+        self.apply_reflow_render(tui, terminal_width, result)?;
+        self.transcript_reflow.clear_pending_reflow();
+        self.transcript_reflow.mark_reflowed_width(terminal_width.0);
+        Ok(true)
     }
 
     /// Discard terminal render products while preserving the canonical cells and view position.
-    fn discard_scrollback_render_work(&mut self, tui: &mut tui::Tui) {
+    pub(super) fn discard_scrollback_render_work(&mut self, tui: &mut tui::Tui) {
+        self.background_reflow.clear();
         self.transcript_reflow.clear_pending_reflow();
         self.transcript_reflow.clear_stream_flags();
         self.reset_history_emission_state();
@@ -651,73 +946,29 @@ impl App {
     /// were a new top-level history item. The final row trim happens after separators are restored,
     /// so the returned rows obey the cap exactly.
     pub(super) fn render_transcript_lines_for_reflow(&mut self, width: u16) -> ReflowRenderResult {
-        let row_cap = self.resize_reflow_max_rows();
-        let mut cell_displays = VecDeque::new();
-        let mut rendered_rows = 0usize;
-        let mut start = self
-            .native_history
-            .replayable_cells(&self.transcript_cells)
-            .len();
-        let mut history_was_truncated = false;
+        let result = render_reflow_cells(
+            self.native_history.replayable_cells(&self.transcript_cells),
+            width,
+            self.chat_widget.history_render_mode(),
+            self.resize_reflow_max_rows(),
+            &AtomicBool::new(false),
+        )
+        .unwrap_or_default();
+        self.finish_reflow_render(width, result)
+    }
 
-        while start > 0 {
-            start -= 1;
-            let cell = self.transcript_cells[start].clone();
-            let lines = cell
-                .display_hyperlink_lines_for_mode(width, self.chat_widget.history_render_mode());
-            rendered_rows += lines.len();
-            cell_displays.push_front(ReflowCellDisplay {
-                lines,
-                is_stream_continuation: cell.is_stream_continuation(),
-            });
-
-            if row_cap.is_some_and(|max_rows| rendered_rows > max_rows) {
-                history_was_truncated = true;
-                break;
-            }
-        }
-
-        while start > 0
-            && cell_displays
-                .front()
-                .is_some_and(|display| display.is_stream_continuation)
-        {
-            start -= 1;
-            let cell = self.transcript_cells[start].clone();
-            cell_displays.push_front(ReflowCellDisplay {
-                lines: cell.display_hyperlink_lines_for_mode(
-                    width,
-                    self.chat_widget.history_render_mode(),
-                ),
-                is_stream_continuation: cell.is_stream_continuation(),
-            });
-        }
-
-        let mut has_emitted_history_lines = false;
-        let mut reflowed_lines = Vec::new();
-        for display in cell_displays {
-            if !display.lines.is_empty() && !display.is_stream_continuation {
-                if has_emitted_history_lines {
-                    reflowed_lines.push(HyperlinkLine::new(Line::from("")));
-                } else {
-                    has_emitted_history_lines = true;
-                }
-            }
-            reflowed_lines.extend(display.lines);
-        }
-        if let Some(max_rows) = row_cap
-            && reflowed_lines.len() > max_rows
-        {
-            history_was_truncated = true;
-            let trimmed_line_count = reflowed_lines.len() - max_rows;
-            reflowed_lines = reflowed_lines.split_off(trimmed_line_count);
-        }
-        self.prepend_scrollback_history_notice(&mut reflowed_lines, history_was_truncated, width);
-        self.has_emitted_history_lines = !reflowed_lines.is_empty();
-
-        ReflowRenderResult {
-            lines: reflowed_lines,
-        }
+    fn finish_reflow_render(
+        &mut self,
+        width: u16,
+        mut result: ReflowRenderResult,
+    ) -> ReflowRenderResult {
+        self.prepend_scrollback_history_notice(
+            &mut result.lines,
+            result.history_was_truncated,
+            width,
+        );
+        self.has_emitted_history_lines = !result.lines.is_empty();
+        result
     }
 
     fn prepend_scrollback_history_notice(
@@ -726,29 +977,24 @@ impl App {
         history_was_truncated: bool,
         width: u16,
     ) {
-        if lines.is_empty() || (!history_was_truncated && !self.scrollback_has_older_history) {
-            return;
-        }
-        let Some(binding) = crate::keymap::primary_binding(&self.keymap.app.open_transcript) else {
-            return;
-        };
-        let notice = Line::from(format!(
-            "Earlier messages are available — press {} to view the full transcript",
-            binding.display_label()
-        ))
-        .dim();
-        let notice_lines =
-            crate::wrapping::word_wrap_lines([notice], usize::from(width.max(/*other*/ 1)));
-        if let Some(max_rows) = self.resize_reflow_max_rows() {
-            let available_history_rows = max_rows.saturating_sub(notice_lines.len());
-            if available_history_rows == 0 {
-                return;
-            }
-            if lines.len() > available_history_rows {
-                lines.drain(..lines.len() - available_history_rows);
-            }
-        }
-        lines.splice(0..0, notice_lines.into_iter().map(HyperlinkLine::new));
+        prepend_history_notice(
+            lines,
+            history_was_truncated,
+            width,
+            self.resize_reflow_max_rows(),
+            self.scrollback_has_older_history,
+            self.reflow_notice_text().as_deref(),
+        );
+    }
+
+    fn reflow_notice_text(&self) -> Option<Arc<str>> {
+        crate::keymap::primary_binding(&self.keymap.app.open_transcript).map(|binding| {
+            format!(
+                "Earlier messages are available — press {} to view the full transcript",
+                binding.display_label()
+            )
+            .into()
+        })
     }
 
     /// Return whether current transcript state should be treated as stream-time resize state.
@@ -763,6 +1009,124 @@ impl App {
                 < self.transcript_cells.len()
             || trailing_run_start::<history_cell::ProposedPlanStreamCell>(&self.transcript_cells)
                 < self.transcript_cells.len()
+    }
+}
+
+#[cfg(test)]
+mod background_reflow_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[derive(Debug)]
+    struct GatedCell {
+        first: AtomicBool,
+        entered: Barrier,
+        released: Barrier,
+    }
+
+    impl HistoryCell for GatedCell {
+        fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+            if self.first.swap(false, Ordering::Relaxed) {
+                self.entered.wait();
+                self.released.wait();
+            }
+            vec![Line::from(format!("width={width}"))]
+        }
+
+        fn raw_lines(&self) -> Vec<Line<'static>> {
+            self.display_lines(0)
+        }
+    }
+
+    fn key(width: u16) -> ReflowKey {
+        ReflowKey {
+            width,
+            terminal_width: width,
+            row_cap: None,
+            mode: HistoryRenderMode::Rich,
+            theme_revision: 0,
+            terminal_fg: None,
+            terminal_bg: None,
+            color_level: crate::terminal_palette::StdoutColorLevel::Unknown,
+            wrap_policy: HistoryLineWrapPolicy::PreWrap,
+            older_history: false,
+            notice: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn preparing_returns_before_render_and_discards_an_obsolete_width() {
+        let cell = Arc::new(GatedCell {
+            first: AtomicBool::new(true),
+            entered: Barrier::new(2),
+            released: Barrier::new(2),
+        });
+        let sources: Vec<Arc<dyn HistoryCell>> = (0..32).map(|_| cell.clone() as _).collect();
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let sender = crate::app_event_sender::AppEventSender::new(sender);
+        let mut state = BackgroundReflow::default();
+        assert!(matches!(
+            state.prepare(&sources, key(222), &sender),
+            PreparedReflow::Pending
+        ));
+        // The foreground got control back even though rendering cannot finish yet.
+        cell.entered.wait();
+        let first_id = state.job.as_ref().unwrap().id;
+        assert!(matches!(
+            state.prepare(&sources, key(74), &sender),
+            PreparedReflow::Pending
+        ));
+        cell.released.wait();
+        tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.prepare(&sources, key(74), &sender),
+            PreparedReflow::Pending
+        ));
+        assert!(!state.is_current(first_id));
+        tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        let PreparedReflow::Ready(result) = state.prepare(&sources, key(74), &sender) else {
+            panic!("expected the current-width result");
+        };
+        let prepared = result.prepared.expect("worker prepared terminal output");
+        assert!(!prepared.source.is_empty());
+        assert!(
+            prepared
+                .source
+                .iter()
+                .filter(|line| !line.line.spans.is_empty())
+                .all(|line| {
+                    line.line.to_string().is_empty() || line.line.to_string() == "width=74"
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_transcript_cancels_work_and_keeps_request_ids_unique() {
+        let cell = Arc::new(GatedCell {
+            first: AtomicBool::new(true),
+            entered: Barrier::new(2),
+            released: Barrier::new(2),
+        });
+        let sources: Vec<Arc<dyn HistoryCell>> = (0..32).map(|_| cell.clone() as _).collect();
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let sender = crate::app_event_sender::AppEventSender::new(sender);
+        let mut state = BackgroundReflow::default();
+        state.prepare(&sources, key(222), &sender);
+        cell.entered.wait();
+        let old_id = state.job.as_ref().unwrap().id;
+        state.clear();
+        assert!(!state.is_current(old_id));
+        cell.released.wait();
+        tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        state.prepare(&sources, key(222), &sender);
+        assert_ne!(state.job.as_ref().unwrap().id, old_id);
+        state.clear();
     }
 }
 

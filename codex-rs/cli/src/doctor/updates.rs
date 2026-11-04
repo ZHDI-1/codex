@@ -32,8 +32,8 @@ use super::network;
 
 const MAX_VERSION_RESPONSE_BYTES: usize = 1024 * 1024;
 
-const VERSION_FILE_NAME: &str = "version.json";
-const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const VERSION_FILE_NAME: &str = codex_install_context::release_channel::VERSION_CACHE_FILENAME;
+const GITHUB_LATEST_RELEASE_URL: &str = codex_install_context::release_channel::LATEST_RELEASE_URL;
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const DESKTOP_UPDATE_URL: &str = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
@@ -388,6 +388,9 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
 }
 
 fn update_action_label(context: &InstallContext) -> &'static str {
+    if codex_install_context::release_channel::is_downstream() {
+        return "downstream standalone installer";
+    }
     match &context.method {
         InstallMethod::Npm => "npm install -g @openai/codex",
         InstallMethod::Bun => "bun install -g @openai/codex",
@@ -403,6 +406,9 @@ async fn fetch_latest_version(
     client: &RouteAwareClientPool,
     context: &InstallContext,
 ) -> Result<String, String> {
+    if codex_install_context::release_channel::is_downstream() {
+        return fetch_latest_github_release_version(client).await;
+    }
     match &context.method {
         InstallMethod::Brew => fetch_homebrew_cask_version(client).await,
         InstallMethod::Npm
@@ -471,18 +477,7 @@ where
 }
 
 fn is_newer(latest: &str, current: &str) -> Option<bool> {
-    match (parse_version(latest), parse_version(current)) {
-        (Some(latest), Some(current)) => Some(latest > current),
-        (Some(_), None) | (None, Some(_)) | (None, None) => None,
-    }
-}
-
-fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = value.trim().split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts.next()?.parse::<u64>().ok()?;
-    let patch = parts.next()?.parse::<u64>().ok()?;
-    Some((major, minor, patch))
+    codex_install_context::release_channel::is_newer(latest, current)
 }
 
 #[derive(Deserialize)]
