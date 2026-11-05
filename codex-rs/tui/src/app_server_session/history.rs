@@ -1,6 +1,6 @@
 //! Bounded app-server transcript loading for resume, fork, and transcript views.
 
-use codex_app_server_protocol::ThreadItem;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use super::AppServerSession;
@@ -14,6 +14,8 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemEntry;
 use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadItemsListCursor;
 use codex_app_server_protocol::ThreadItemsListParams;
@@ -124,6 +126,50 @@ fn advancing_cursor(
         seen_cursors.insert(current.to_string());
     }
     next.filter(|next| seen_cursors.insert(next.clone()))
+}
+
+/// Prepend a descending item page with one move of each affected turn's retained suffix.
+///
+/// Keep the first copy of overlapping items, including duplicates within this page. The returned
+/// payloads retain the page's global chronological order even when its turns are interleaved.
+fn merge_item_page_into_turns(
+    turns: &mut [Turn],
+    page: Vec<ThreadItemEntry>,
+) -> Vec<ThreadItemPayload> {
+    let mut by_turn: HashMap<String, Vec<(usize, ThreadItem)>> = HashMap::new();
+    for (index, entry) in page.into_iter().enumerate() {
+        by_turn
+            .entry(entry.turn_id.clone())
+            .or_default()
+            .push((index, ThreadItem::from(entry)));
+    }
+    let mut added = Vec::new();
+    for turn in turns {
+        let Some(incoming) = by_turn.remove(&turn.id) else {
+            continue;
+        };
+        let keep: Vec<bool> = {
+            let mut seen: HashSet<&str> = turn.items.iter().map(ThreadItem::id).collect();
+            incoming
+                .iter()
+                .map(|(_, item)| seen.insert(item.id()))
+                .collect()
+        };
+        let mut older = Vec::new();
+        for ((index, item), keep) in incoming.into_iter().zip(keep) {
+            if keep {
+                added.push((index, item.payload.clone()));
+                older.push(item);
+            }
+        }
+        if !older.is_empty() {
+            older.reverse();
+            turn.items.splice(0..0, older);
+            turn.items_view = TurnItemsView::Summary;
+        }
+    }
+    added.sort_unstable_by_key(|(index, _)| std::cmp::Reverse(*index));
+    added.into_iter().map(|(_, payload)| payload).collect()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -355,38 +401,27 @@ impl AppServerSession {
             .filter(|entry| !turns.iter().any(|turn| turn.id == entry.turn_id))
             .map(|entry| entry.turn_id.clone())
             .collect::<HashSet<_>>();
-        let mut items = Vec::new();
-        for entry in page.data {
-            while !turns.iter().any(|turn| turn.id == entry.turn_id) {
-                let Some(cursor) = state.next_turn_cursor.take() else {
-                    break;
-                };
-                // Fetch only the remaining item-backed turns so metadata does not run ahead
-                // of this page. Empty turns between them may require another bounded request.
-                let limit = missing_turn_ids.len().min(HISTORY_ITEM_PAGE_LIMIT as usize) as u32;
-                let page = self
-                    .thread_turns_page(thread_id, Some(cursor.clone()), limit)
-                    .await?;
-                state.next_turn_cursor = advancing_cursor(
-                    Some(&cursor),
-                    page.next_cursor,
-                    &mut state.seen_turn_cursors,
-                );
-                for turn in &page.data {
-                    missing_turn_ids.remove(&turn.id);
-                }
-                turns.splice(0..0, page.data.into_iter().rev());
+        while !missing_turn_ids.is_empty() {
+            let Some(cursor) = state.next_turn_cursor.take() else {
+                break;
+            };
+            // Fetch only the remaining item-backed turns so metadata does not run ahead
+            // of this page. Empty turns between them may require another bounded request.
+            let limit = missing_turn_ids.len().min(HISTORY_ITEM_PAGE_LIMIT as usize) as u32;
+            let page = self
+                .thread_turns_page(thread_id, Some(cursor.clone()), limit)
+                .await?;
+            state.next_turn_cursor = advancing_cursor(
+                Some(&cursor),
+                page.next_cursor,
+                &mut state.seen_turn_cursors,
+            );
+            for turn in &page.data {
+                missing_turn_ids.remove(&turn.id);
             }
-            if let Some(turn) = turns.iter_mut().find(|turn| turn.id == entry.turn_id)
-                && !turn.items.iter().any(|item| item.id() == entry.item.id())
-            {
-                items.push(entry.item.payload.clone());
-                turn.items.insert(/*index*/ 0, ThreadItem::from(entry));
-                turn.items_view = TurnItemsView::Summary;
-            }
+            turns.splice(0..0, page.data.into_iter().rev());
         }
-        items.reverse();
-        Ok(items)
+        Ok(merge_item_page_into_turns(turns, page.data))
     }
 
     /// Hydrates paginated threads through bounded turn and item pages.

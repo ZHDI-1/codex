@@ -64,6 +64,7 @@ struct ReflowCellDisplay {
 pub(super) struct ReflowRenderResult {
     pub(super) lines: Vec<HyperlinkLine>,
     history_was_truncated: bool,
+    emitted_history_cell: bool,
     prepared: Option<crate::insert_history::PreparedHistory>,
 }
 
@@ -138,10 +139,17 @@ impl BackgroundReflow {
             self.clear();
             return PreparedReflow::Synchronous;
         }
+        let mut prefix = None;
         if let Some(job) = &self.job {
+            // New warnings and other finalized cells can arrive during initial replay. An
+            // unchanged, uncapped prefix remains useful; retain it instead of rendering it again.
+            // Capped histories and history notices depend on the whole tail, so keep their normal
+            // invalidation behavior. Explicit invalidation still covers cells mutated in place.
+            let append_only =
+                key.row_cap.is_none() && !key.older_history && job.sources.len() <= sources.len();
             let matches = !job.cancelled.load(Ordering::Relaxed)
                 && job.key == key
-                && job.sources.len() == sources.len()
+                && (job.sources.len() == sources.len() || append_only)
                 && job
                     .sources
                     .iter()
@@ -154,8 +162,12 @@ impl BackgroundReflow {
             // than queueing another full copy of the transcript on every draw.
             match job.result.try_recv() {
                 Ok(Ok(Ok(Some(result)))) if matches => {
+                    let rendered_count = job.sources.len();
                     self.job = None;
-                    return PreparedReflow::Ready(result);
+                    if rendered_count == sources.len() {
+                        return PreparedReflow::Ready(result);
+                    }
+                    prefix = Some((rendered_count, result));
                 }
                 Ok(Ok(Ok(_))) => self.job = None,
                 Ok(Err(_)) | Ok(Ok(Err(_))) | Err(mpsc::TryRecvError::Disconnected) => {
@@ -174,22 +186,37 @@ impl BackgroundReflow {
         let cancelled = Arc::new(AtomicBool::new(false));
         let (sender, result) = mpsc::channel();
         let weak_sources = sources.iter().map(Arc::downgrade).collect();
-        let sources = sources.to_vec();
+        let rendered_count = prefix.as_ref().map_or(0, |(count, _)| *count);
+        let sources = sources[rendered_count..].to_vec();
         let worker_cancelled = cancelled.clone();
         let events = events.clone();
         let worker_key = key.clone();
         let spawned = crate::history_render::spawn(move || {
             let rendered =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> std::io::Result<_> {
-                    let Some(mut result) = render_reflow_cells(
+                    let mut prefix = prefix.map(|(_, mut result)| {
+                        if let Some(prepared) = result.prepared.take() {
+                            result.lines = prepared.source;
+                            // The old ANSI buffer is released here, off the UI thread.
+                        }
+                        result
+                    });
+                    let Some(mut result) = render_reflow_cells_after(
                         &sources,
                         worker_key.width,
                         worker_key.mode,
                         worker_key.row_cap,
                         &worker_cancelled,
+                        prefix
+                            .as_ref()
+                            .is_some_and(|result| result.emitted_history_cell),
                     ) else {
                         return Ok(None);
                     };
+                    if let Some(mut prefix) = prefix.take() {
+                        prefix.lines.append(&mut result.lines);
+                        result.lines = prefix.lines;
+                    }
                     prepend_history_notice(
                         &mut result.lines,
                         result.history_was_truncated,
@@ -233,6 +260,17 @@ fn render_reflow_cells(
     row_cap: Option<usize>,
     cancelled: &AtomicBool,
 ) -> Option<ReflowRenderResult> {
+    render_reflow_cells_after(cells, width, mode, row_cap, cancelled, false)
+}
+
+fn render_reflow_cells_after(
+    cells: &[Arc<dyn HistoryCell>],
+    width: u16,
+    mode: HistoryRenderMode,
+    row_cap: Option<usize>,
+    cancelled: &AtomicBool,
+    emitted_history_cell: bool,
+) -> Option<ReflowRenderResult> {
     let rendered = crate::history_render::render_tail(cells, row_cap, cancelled, |cell| {
         let lines = cell.display_hyperlink_lines_for_mode(width, mode);
         crate::history_render::Rendered {
@@ -245,7 +283,7 @@ fn render_reflow_cells(
         }
     })?;
     let mut lines = Vec::new();
-    let mut emitted = false;
+    let mut emitted = emitted_history_cell;
     for display in rendered.cells {
         if !display.lines.is_empty() && !display.is_stream_continuation {
             if emitted {
@@ -265,6 +303,7 @@ fn render_reflow_cells(
     Some(ReflowRenderResult {
         lines,
         history_was_truncated,
+        emitted_history_cell: emitted,
         prepared: None,
     })
 }
@@ -1016,16 +1055,19 @@ impl App {
 mod background_reflow_tests {
     use super::*;
     use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
 
     #[derive(Debug)]
     struct GatedCell {
         first: AtomicBool,
+        renders: AtomicUsize,
         entered: Barrier,
         released: Barrier,
     }
 
     impl HistoryCell for GatedCell {
         fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+            self.renders.fetch_add(1, Ordering::Relaxed);
             if self.first.swap(false, Ordering::Relaxed) {
                 self.entered.wait();
                 self.released.wait();
@@ -1035,6 +1077,30 @@ mod background_reflow_tests {
 
         fn raw_lines(&self) -> Vec<Line<'static>> {
             self.display_lines(0)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TailCell {
+        lines: Vec<HyperlinkLine>,
+        continuation: bool,
+    }
+
+    impl HistoryCell for TailCell {
+        fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+            self.lines.iter().map(|line| line.line.clone()).collect()
+        }
+
+        fn raw_lines(&self) -> Vec<Line<'static>> {
+            self.display_lines(0)
+        }
+
+        fn display_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine> {
+            self.lines.clone()
+        }
+
+        fn is_stream_continuation(&self) -> bool {
+            self.continuation
         }
     }
 
@@ -1058,6 +1124,7 @@ mod background_reflow_tests {
     async fn preparing_returns_before_render_and_discards_an_obsolete_width() {
         let cell = Arc::new(GatedCell {
             first: AtomicBool::new(true),
+            renders: AtomicUsize::new(0),
             entered: Barrier::new(2),
             released: Barrier::new(2),
         });
@@ -1108,6 +1175,7 @@ mod background_reflow_tests {
     async fn clearing_transcript_cancels_work_and_keeps_request_ids_unique() {
         let cell = Arc::new(GatedCell {
             first: AtomicBool::new(true),
+            renders: AtomicUsize::new(0),
             entered: Barrier::new(2),
             released: Barrier::new(2),
         });
@@ -1127,6 +1195,123 @@ mod background_reflow_tests {
         state.prepare(&sources, key(222), &sender);
         assert_ne!(state.job.as_ref().unwrap().id, old_id);
         state.clear();
+    }
+
+    #[tokio::test]
+    async fn appending_cells_reuses_uncapped_work_but_invalidates_capped_work() {
+        for row_cap in [None, Some(10_000)] {
+            let cell = Arc::new(GatedCell {
+                first: AtomicBool::new(true),
+                renders: AtomicUsize::new(0),
+                entered: Barrier::new(2),
+                released: Barrier::new(2),
+            });
+            let mut sources: Vec<Arc<dyn HistoryCell>> =
+                (0..32).map(|_| cell.clone() as _).collect();
+            let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+            let sender = crate::app_event_sender::AppEventSender::new(sender);
+            let mut state = BackgroundReflow::default();
+            let mut key = key(74);
+            key.row_cap = row_cap;
+            state.prepare(&sources, key.clone(), &sender);
+            cell.entered.wait();
+            sources.push(Arc::new(TailCell {
+                lines: Vec::new(),
+                continuation: false,
+            }));
+            for continuation in [true, false] {
+                sources.push(Arc::new(TailCell {
+                    lines: vec![crate::terminal_hyperlinks::annotate_web_urls_in_line(
+                        Line::from("https://example.com/appended").bold(),
+                    )],
+                    continuation,
+                }));
+            }
+            assert!(matches!(
+                state.prepare(&sources, key.clone(), &sender),
+                PreparedReflow::Pending
+            ));
+            assert_eq!(
+                state
+                    .job
+                    .as_ref()
+                    .unwrap()
+                    .cancelled
+                    .load(Ordering::Relaxed),
+                row_cap.is_some()
+            );
+            cell.released.wait();
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .unwrap();
+            assert!(matches!(
+                state.prepare(&sources, key.clone(), &sender),
+                PreparedReflow::Pending
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .unwrap();
+            let PreparedReflow::Ready(result) = state.prepare(&sources, key, &sender) else {
+                panic!("expected the extended result");
+            };
+            let renders = cell.renders.load(Ordering::Relaxed);
+            if row_cap.is_none() {
+                assert_eq!(renders, 32);
+            } else {
+                // Cancellation may stop the first job before all its cells start.
+                assert!((33..=64).contains(&renders));
+            }
+            let expected = render_reflow_cells(
+                &sources,
+                74,
+                HistoryRenderMode::Rich,
+                row_cap,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert_eq!(result.prepared.unwrap().source, expected.lines);
+        }
+    }
+
+    #[test]
+    fn extending_empty_and_continuation_prefixes_preserves_separators() {
+        for prefix_lines in [Vec::new(), vec![HyperlinkLine::from("continued")]] {
+            for continuation in [false, true] {
+                let sources: Vec<Arc<dyn HistoryCell>> = vec![
+                    Arc::new(TailCell {
+                        lines: prefix_lines.clone(),
+                        continuation,
+                    }),
+                    Arc::new(TailCell {
+                        lines: vec![HyperlinkLine::from("appended")],
+                        continuation: false,
+                    }),
+                ];
+                let cancelled = AtomicBool::new(false);
+                let mut prefix = render_reflow_cells(
+                    &sources[..1],
+                    74,
+                    HistoryRenderMode::Rich,
+                    None,
+                    &cancelled,
+                )
+                .unwrap();
+                let suffix = render_reflow_cells_after(
+                    &sources[1..],
+                    74,
+                    HistoryRenderMode::Rich,
+                    None,
+                    &cancelled,
+                    prefix.emitted_history_cell,
+                )
+                .unwrap();
+                prefix.lines.extend(suffix.lines);
+                let expected =
+                    render_reflow_cells(&sources, 74, HistoryRenderMode::Rich, None, &cancelled)
+                        .unwrap();
+                assert_eq!(prefix.lines, expected.lines);
+            }
+        }
     }
 }
 

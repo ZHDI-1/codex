@@ -1,6 +1,7 @@
 use super::HistoryHydrationScope;
 use super::HistoryLoadBudget;
 use super::advancing_cursor;
+use super::merge_item_page_into_turns;
 use super::rendered_cell_rows;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::HistoryRenderMode;
@@ -12,6 +13,78 @@ use pretty_assertions::assert_eq;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+
+#[test]
+fn older_item_pages_preserve_order_overlap_timestamps_and_live_turn_state() {
+    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadItemEntry;
+    use codex_app_server_protocol::ThreadItemPayload;
+    use codex_app_server_protocol::Turn;
+    use codex_app_server_protocol::TurnItemsView;
+    use codex_app_server_protocol::TurnStatus;
+
+    let entry = |turn_id: &str, item_id: &str, started_at_ms| ThreadItemEntry {
+        turn_id: turn_id.to_string(),
+        item: ThreadItem::untimed(ThreadItemPayload::UserMessage {
+            id: item_id.to_string(),
+            client_id: None,
+            content: Vec::new(),
+        }),
+        started_at_ms: Some(started_at_ms),
+        completed_at_ms: Some(started_at_ms + 1),
+    };
+    let make_turn = |id: &str, items: Vec<ThreadItem>| Turn {
+        id: id.to_string(),
+        root_turn_id: Some("root".to_string()),
+        items,
+        items_view: TurnItemsView::Full,
+        status: TurnStatus::InProgress,
+        error: None,
+        started_at: Some(1),
+        completed_at: None,
+        duration_ms: None,
+    };
+    let mut turns = vec![
+        make_turn("a", vec![ThreadItem::from(entry("a", "live", 7))]),
+        make_turn("b", Vec::new()),
+        make_turn("c", vec![ThreadItem::from(entry("c", "overlap", 8))]),
+    ];
+    let added = merge_item_page_into_turns(
+        &mut turns,
+        vec![
+            entry("b", "b1", 30),
+            entry("a", "a2", 20),
+            entry("b", "b1", 99),
+            entry("a", "live", 99),
+            entry("a", "a1", 10),
+            entry("missing", "ignored", 1),
+            entry("c", "overlap", 99),
+        ],
+    );
+    assert_eq!(
+        added.iter().map(ThreadItemPayload::id).collect::<Vec<_>>(),
+        ["a1", "a2", "b1"],
+    );
+    assert_eq!(
+        turns[0]
+            .items
+            .iter()
+            .map(ThreadItem::id)
+            .collect::<Vec<_>>(),
+        ["a1", "a2", "live"],
+    );
+    assert_eq!(turns[0].items[2].started_at_ms, Some(7));
+    assert_eq!(turns[1].items[0].started_at_ms, Some(30));
+    assert_eq!(turns[1].items[0].completed_at_ms, Some(31));
+    assert_eq!(turns[0].items_view, TurnItemsView::Summary);
+    assert_eq!(turns[2].items_view, TurnItemsView::Full);
+    assert_eq!(turns[2].items[0].started_at_ms, Some(8));
+    for turn in turns {
+        assert_eq!(turn.status, TurnStatus::InProgress);
+        assert_eq!(turn.root_turn_id.as_deref(), Some("root"));
+        assert_eq!(turn.started_at, Some(1));
+    }
+}
 
 #[tokio::test]
 async fn prompt_edit_reads_only_the_selected_prompt_and_rejects_stale_or_steered_selections()
