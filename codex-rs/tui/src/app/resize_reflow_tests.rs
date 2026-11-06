@@ -22,6 +22,48 @@ fn rendered_line_text(line: &HyperlinkLine) -> String {
 }
 
 #[tokio::test]
+async fn resize_reflow_preserves_latest_clear_boundary_for_capped_and_unlimited_history() {
+    for max_rows in [0, 4096] {
+        let mut app = make_test_app().await;
+        app.local_settings.tui.terminal_resize_reflow_max_rows = Some(max_rows);
+        app.scrollback_has_older_history = true;
+        let header = || {
+            Arc::new(history_cell::ClearScreenHeader(
+                history_cell::SessionHeaderHistoryCell::new(
+                    "gpt-test".to_string(),
+                    None,
+                    std::path::PathBuf::from("/tmp"),
+                    "test",
+                ),
+            )) as Arc<dyn HistoryCell>
+        };
+        let plain = |text: &'static str| {
+            Arc::new(PlainHistoryCell::new(vec![Line::from(text)])) as Arc<dyn HistoryCell>
+        };
+        app.transcript_cells = vec![
+            plain("before first clear"),
+            header(),
+            plain("before latest clear"),
+            header(),
+            plain("visible after clear"),
+        ];
+        let rendered = app.render_transcript_lines_for_reflow(80);
+        let text = rendered
+            .lines
+            .iter()
+            .map(rendered_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("OpenAI Codex"));
+        assert!(text.contains("visible after clear"));
+        assert!(!text.contains("before first clear"));
+        assert!(!text.contains("before latest clear"));
+        assert_eq!(app.transcript_cells.len(), 5);
+        assert!(!app.scrollback_history_needs_top_up(0));
+    }
+}
+
+#[tokio::test]
 async fn resize_reflow_preserves_configured_scrollback_beyond_the_visible_viewport() {
     let mut app = make_test_app().await;
     app.local_settings.tui.terminal_resize_reflow_max_rows = Some(32);

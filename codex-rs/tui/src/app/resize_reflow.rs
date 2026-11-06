@@ -135,6 +135,9 @@ impl BackgroundReflow {
         key: ReflowKey,
         events: &crate::app_event_sender::AppEventSender,
     ) -> PreparedReflow {
+        // Select the visible suffix before comparing identities. A newly appended clear header
+        // replaces the old render's source rather than extending it with stale visible history.
+        let sources = cells_since_last_clear(sources);
         if sources.len() < BACKGROUND_REFLOW_MIN_CELLS || self.unavailable {
             self.clear();
             return PreparedReflow::Synchronous;
@@ -260,7 +263,24 @@ fn render_reflow_cells(
     row_cap: Option<usize>,
     cancelled: &AtomicBool,
 ) -> Option<ReflowRenderResult> {
-    render_reflow_cells_after(cells, width, mode, row_cap, cancelled, false)
+    render_reflow_cells_after(
+        cells_since_last_clear(cells),
+        width,
+        mode,
+        row_cap,
+        cancelled,
+        false,
+    )
+}
+
+/// Ctrl+L retains the transcript for browsing while starting a new native scrollback view.
+/// Limit rendering before dispatch so parallel workers also skip the cleared prefix.
+fn cells_since_last_clear(cells: &[Arc<dyn HistoryCell>]) -> &[Arc<dyn HistoryCell>] {
+    let start = cells
+        .iter()
+        .rposition(|cell| cell.as_any().is::<history_cell::ClearScreenHeader>())
+        .unwrap_or(0);
+    &cells[start..]
 }
 
 fn render_reflow_cells_after(
@@ -913,6 +933,10 @@ impl App {
             && self
                 .resize_reflow_max_rows()
                 .is_some_and(|max_rows| rendered_rows < max_rows)
+            && !self
+                .transcript_cells
+                .iter()
+                .any(|cell| cell.as_any().is::<history_cell::ClearScreenHeader>())
     }
 
     fn request_scrollback_history_top_up(&self, rendered_rows: usize) {
@@ -1195,6 +1219,75 @@ mod background_reflow_tests {
         state.prepare(&sources, key(222), &sender);
         assert_ne!(state.job.as_ref().unwrap().id, old_id);
         state.clear();
+    }
+
+    #[tokio::test]
+    async fn clear_header_cancels_in_flight_prefix_instead_of_extending_it() {
+        let cell = Arc::new(GatedCell {
+            first: AtomicBool::new(true),
+            renders: AtomicUsize::new(0),
+            entered: Barrier::new(2),
+            released: Barrier::new(2),
+        });
+        let mut sources: Vec<Arc<dyn HistoryCell>> = (0..32).map(|_| cell.clone() as _).collect();
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let sender = crate::app_event_sender::AppEventSender::new(sender);
+        let mut state = BackgroundReflow::default();
+        state.prepare(&sources, key(74), &sender);
+        cell.entered.wait();
+        let old_id = state.job.as_ref().unwrap().id;
+        sources.push(Arc::new(history_cell::ClearScreenHeader(
+            history_cell::SessionHeaderHistoryCell::new(
+                "gpt-test".to_string(),
+                None,
+                std::path::PathBuf::from("/tmp"),
+                "test",
+            ),
+        )));
+        sources.extend((0..32).map(|_| {
+            Arc::new(TailCell {
+                lines: vec![HyperlinkLine::from("after clear")],
+                continuation: false,
+            }) as Arc<dyn HistoryCell>
+        }));
+        assert!(matches!(
+            state.prepare(&sources, key(74), &sender),
+            PreparedReflow::Pending
+        ));
+        let cancelled = state
+            .job
+            .as_ref()
+            .unwrap()
+            .cancelled
+            .load(Ordering::Relaxed);
+        cell.released.wait();
+        assert!(cancelled);
+        tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        assert!(matches!(
+            state.prepare(&sources, key(74), &sender),
+            PreparedReflow::Pending
+        ));
+        assert!(!state.is_current(old_id));
+        tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        let PreparedReflow::Ready(result) = state.prepare(&sources, key(74), &sender) else {
+            panic!("expected the post-clear render");
+        };
+        let text = result
+            .prepared
+            .unwrap()
+            .source
+            .iter()
+            .map(|line| line.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("OpenAI Codex"));
+        assert_eq!(text.matches("after clear").count(), 32);
+        assert!(!text.contains("width="), "cleared prefix must stay hidden");
+        assert_eq!(sources.len(), 65, "clearing must retain source history");
     }
 
     #[tokio::test]

@@ -246,13 +246,12 @@ jobs:
           git -C "$RUNNER_TEMP/candidate" push "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$RELEASE_TAG"
           notes="$RUNNER_TEMP/release-notes.txt"
           cat > "$notes" <<EOF
-          Patched Codex: cached/parallel history rendering, up to 24 workers.
+          Cached/parallel history rendering with up to 24 workers, batched history loading,
+          and reuse of unchanged background render prefixes during startup.
 
           Esc-Esc prompt editing reuses cached history, validates the selected prompt,
           and prepares scrollback replay in the background.
-          Local long-session benchmark, Enter to editable composer (median of three):
-          fullscreen with loaded history 2.323s -> 0.331s; unlimited scrollback 2.940s -> 0.325s.
-          Background repaint can continue afterward. Fresh fullscreen paging remains a separate delay.
+          Ctrl+L preserves upstream clear-screen boundaries during resize and background rendering.
 
           Upstream: $UPSTREAM_TAG
           Maintenance: $GITHUB_SHA

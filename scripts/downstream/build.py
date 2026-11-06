@@ -104,6 +104,7 @@ def build(root, dist, target, phase):
                 "app_server_session::history::tests", "history_render::tests",
                 "render::highlight_cache::tests", "resize_reflow", "insert_history",
                 "prompt_edit", "backtrack", "native_history",
+                "ctrl_l", "clear_ui",
                 "update_versions", "update_action", "updates_cache", cwd=rust)
 
     if phase in ("all", "package"):
