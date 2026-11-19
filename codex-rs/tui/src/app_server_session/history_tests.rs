@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 #[test]
-fn older_item_pages_preserve_order_overlap_timestamps_and_live_turn_state() {
+fn older_item_pages_preserve_order_overlap_timestamps_and_live_turn_state() -> color_eyre::Result<()>
+{
     use codex_app_server_protocol::ThreadItem;
     use codex_app_server_protocol::ThreadItemEntry;
     use codex_app_server_protocol::ThreadItemPayload;
@@ -32,6 +33,7 @@ fn older_item_pages_preserve_order_overlap_timestamps_and_live_turn_state() {
         }),
         started_at_ms: Some(started_at_ms),
         completed_at_ms: Some(started_at_ms + 1),
+        output_deferred: false,
     };
     let make_turn = |id: &str, items: Vec<ThreadItem>| Turn {
         id: id.to_string(),
@@ -45,9 +47,9 @@ fn older_item_pages_preserve_order_overlap_timestamps_and_live_turn_state() {
         duration_ms: None,
     };
     let mut turns = vec![
-        make_turn("a", vec![ThreadItem::from(entry("a", "live", 7))]),
+        make_turn("a", vec![ThreadItem::try_from(entry("a", "live", 7))?]),
         make_turn("b", Vec::new()),
-        make_turn("c", vec![ThreadItem::from(entry("c", "overlap", 8))]),
+        make_turn("c", vec![ThreadItem::try_from(entry("c", "overlap", 8))?]),
     ];
     let added = merge_item_page_into_turns(
         &mut turns,
@@ -60,7 +62,7 @@ fn older_item_pages_preserve_order_overlap_timestamps_and_live_turn_state() {
             entry("missing", "ignored", 1),
             entry("c", "overlap", 99),
         ],
-    );
+    )?;
     assert_eq!(
         added.iter().map(ThreadItemPayload::id).collect::<Vec<_>>(),
         ["a1", "a2", "b1"],
@@ -84,6 +86,7 @@ fn older_item_pages_preserve_order_overlap_timestamps_and_live_turn_state() {
         assert_eq!(turn.root_turn_id.as_deref(), Some("root"));
         assert_eq!(turn.started_at, Some(1));
     }
+    Ok(())
 }
 
 #[tokio::test]
@@ -171,6 +174,46 @@ async fn prompt_edit_reads_only_the_selected_prompt_and_rejects_stale_or_steered
         let requests = server.await??;
         assert_eq!(requests.len(), if latest == "changed-turn" { 1 } else { 2 });
     }
+    Ok(())
+}
+
+#[test]
+fn older_item_pages_reject_deferred_outputs_but_ignore_existing_and_unknown_items()
+-> color_eyre::Result<()> {
+    use codex_app_server_protocol::DeferredItemOutput;
+    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadItemEntry;
+    use codex_app_server_protocol::ThreadItemPayload;
+    use codex_app_server_protocol::Turn;
+
+    let mut turns: Vec<Turn> = serde_json::from_value(serde_json::json!([{
+        "id": "turn",
+        "status": "inProgress",
+        "items": [{ "type": "userMessage", "id": "existing", "content": [] }]
+    }]))?;
+    let entry = |turn_id: &str, item_id: &str| ThreadItemEntry {
+        turn_id: turn_id.to_owned(),
+        item: ThreadItem::untimed(ThreadItemPayload::UserMessage {
+            id: item_id.to_owned(),
+            client_id: None,
+            content: Vec::new(),
+        }),
+        output_deferred: true,
+        started_at_ms: None,
+        completed_at_ms: None,
+    };
+    let added = merge_item_page_into_turns(
+        &mut turns,
+        vec![entry("turn", "existing"), entry("unknown", "ignored")],
+    )?;
+    assert!(added.is_empty());
+    let error = merge_item_page_into_turns(&mut turns, vec![entry("turn", "deferred")])
+        .expect_err("incomplete output must not become a rendered history item");
+    let error = error.downcast_ref::<DeferredItemOutput>().unwrap();
+    assert_eq!(error.turn_id, "turn");
+    assert_eq!(error.item_id, "deferred");
+    assert_eq!(turns[0].items.len(), 1);
+    assert_eq!(turns[0].items[0].id(), "existing");
     Ok(())
 }
 

@@ -26,11 +26,13 @@ use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnItemsView;
+use codex_app_server_protocol::TurnStatus;
 use codex_protocol::ThreadId;
 use color_eyre::eyre::Result;
 use color_eyre::eyre::WrapErr;
 
 pub(crate) const INITIAL_HISTORY_TURN_LIMIT: u32 = 5;
+const HISTORY_TURN_PAGE_LIMIT: u32 = 100;
 pub(crate) const HISTORY_ITEM_PAGE_LIMIT: u32 = 100;
 pub(crate) const HISTORY_ITEM_SCAN_LIMIT: usize = 4 * HISTORY_ITEM_PAGE_LIMIT as usize;
 
@@ -38,6 +40,8 @@ pub(crate) const HISTORY_ITEM_SCAN_LIMIT: usize = 4 * HISTORY_ITEM_PAGE_LIMIT as
 pub(crate) enum HistoryHydrationScope<'a> {
     Initial,
     Complete,
+    /// Include older turns that have no items.
+    FullTranscript,
     ThroughTurn(&'a str),
 }
 
@@ -70,7 +74,7 @@ impl HistoryLoadBudget {
         let rows = local_settings
             .and_then(|settings| resize_reflow_max_rows(settings.terminal_resize_reflow()));
         let items = match (scope, config, rows) {
-            (HistoryHydrationScope::Complete, _, _)
+            (HistoryHydrationScope::Complete | HistoryHydrationScope::FullTranscript, _, _)
             | (HistoryHydrationScope::ThroughTurn(_), _, _)
             | (HistoryHydrationScope::Initial, Some(_), None) => None,
             (HistoryHydrationScope::Initial, Some(_), Some(max_rows)) => {
@@ -114,6 +118,7 @@ pub(crate) fn thread_items_page_params(
         cursor: cursor.map(ThreadItemsListCursor::Opaque),
         limit: Some(limit),
         sort_direction: Some(SortDirection::Desc),
+        defer_output: None,
     }
 }
 
@@ -128,6 +133,30 @@ fn advancing_cursor(
     next.filter(|next| seen_cursors.insert(next.clone()))
 }
 
+fn prepend_older_turns(turns: &mut Vec<Turn>, mut older: Vec<Turn>) {
+    let mut new_ids: HashSet<_> = older.iter().map(|turn| turn.id.clone()).collect();
+    for known in turns.iter() {
+        new_ids.remove(&known.id);
+    }
+    older.retain(|turn| new_ids.remove(&turn.id));
+    turns.splice(0..0, older.into_iter().rev());
+}
+
+// Turn metadata can extend before the loaded item window. Inside the window an empty
+// interrupted turn is genuinely itemless and its notice is ready to replay.
+fn mark_loaded_interruptions(turns: &mut [Turn], older_cursor: Option<&str>) {
+    let mut in_window = older_cursor.is_none();
+    for turn in turns {
+        in_window |= !turn.items.is_empty();
+        if in_window
+            && turn.status == TurnStatus::Interrupted
+            && turn.items_view == TurnItemsView::NotLoaded
+        {
+            turn.items_view = TurnItemsView::Summary;
+        }
+    }
+}
+
 /// Prepend a descending item page with one move of each affected turn's retained suffix.
 ///
 /// Keep the first copy of overlapping items, including duplicates within this page. The returned
@@ -135,13 +164,13 @@ fn advancing_cursor(
 fn merge_item_page_into_turns(
     turns: &mut [Turn],
     page: Vec<ThreadItemEntry>,
-) -> Vec<ThreadItemPayload> {
-    let mut by_turn: HashMap<String, Vec<(usize, ThreadItem)>> = HashMap::new();
+) -> Result<Vec<ThreadItemPayload>> {
+    let mut by_turn: HashMap<String, Vec<(usize, ThreadItemEntry)>> = HashMap::new();
     for (index, entry) in page.into_iter().enumerate() {
         by_turn
             .entry(entry.turn_id.clone())
             .or_default()
-            .push((index, ThreadItem::from(entry)));
+            .push((index, entry));
     }
     let mut added = Vec::new();
     for turn in turns {
@@ -152,12 +181,13 @@ fn merge_item_page_into_turns(
             let mut seen: HashSet<&str> = turn.items.iter().map(ThreadItem::id).collect();
             incoming
                 .iter()
-                .map(|(_, item)| seen.insert(item.id()))
+                .map(|(_, entry)| seen.insert(entry.item.id()))
                 .collect()
         };
         let mut older = Vec::new();
-        for ((index, item), keep) in incoming.into_iter().zip(keep) {
+        for ((index, entry), keep) in incoming.into_iter().zip(keep) {
             if keep {
+                let item = ThreadItem::try_from(entry)?;
                 added.push((index, item.payload.clone()));
                 older.push(item);
             }
@@ -169,7 +199,7 @@ fn merge_item_page_into_turns(
         }
     }
     added.sort_unstable_by_key(|(index, _)| std::cmp::Reverse(*index));
-    added.into_iter().map(|(_, payload)| payload).collect()
+    Ok(added.into_iter().map(|(_, payload)| payload).collect())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -234,6 +264,7 @@ impl AppServerSession {
                             HISTORY_ITEM_PAGE_LIMIT
                         }),
                         sort_direction: Some(SortDirection::Asc),
+                        defer_output: None,
                     },
                 })
                 .await?;
@@ -310,9 +341,14 @@ impl AppServerSession {
 
     /// Match a completion to the page still pending for this thread, before interpreting its result.
     pub(crate) fn is_older_history_page_pending(&self, thread_id: ThreadId, cursor: &str) -> bool {
-        self.history_pagination.get(&thread_id).is_some_and(|page| {
-            page.loading_older && page.next_item_cursor.as_deref() == Some(cursor)
-        })
+        self.pending_older_history_cursor(thread_id) == Some(cursor)
+    }
+
+    pub(crate) fn pending_older_history_cursor(&self, thread_id: ThreadId) -> Option<&str> {
+        self.history_pagination
+            .get(&thread_id)
+            .filter(|page| page.loading_older)
+            .and_then(|page| page.next_item_cursor.as_deref())
     }
 
     pub(crate) fn cancel_older_history_page(&mut self, thread_id: ThreadId, cursor: &str) {
@@ -339,6 +375,7 @@ impl AppServerSession {
         let items = self
             .merge_thread_item_page(thread_id, page, &mut state, turns)
             .await?;
+        mark_loaded_interruptions(turns, state.next_item_cursor.as_deref());
         state.loading_older = false;
         self.history_pagination.insert(thread_id, state);
         Ok(items)
@@ -419,9 +456,9 @@ impl AppServerSession {
             for turn in &page.data {
                 missing_turn_ids.remove(&turn.id);
             }
-            turns.splice(0..0, page.data.into_iter().rev());
+            prepend_older_turns(turns, page.data);
         }
-        Ok(merge_item_page_into_turns(turns, page.data))
+        merge_item_page_into_turns(turns, page.data)
     }
 
     /// Hydrates paginated threads through bounded turn and item pages.
@@ -449,13 +486,21 @@ impl AppServerSession {
             return Ok(());
         }
 
-        let page = self
-            .thread_turns_page(thread_id, turn_cursor, INITIAL_HISTORY_TURN_LIMIT)
-            .await?;
-        thread.turns = page.data.into_iter().rev().collect();
+        // A missing cursor in a paginated saved-chat resume means this stream was
+        // empty when subscribed. An unanchored page would also contain later live events.
+        let anchored = self.attachment_subscribed == Some(true);
+        let next_turn_cursor = if !anchored || turn_cursor.is_some() {
+            let page = self
+                .thread_turns_page(thread_id, turn_cursor, INITIAL_HISTORY_TURN_LIMIT)
+                .await?;
+            thread.turns = page.data.into_iter().rev().collect();
+            page.next_cursor
+        } else {
+            None
+        };
         let mut state = ThreadHistoryPagination {
             history_mode: ThreadHistoryMode::Paginated,
-            next_turn_cursor: page.next_cursor,
+            next_turn_cursor,
             next_item_cursor: item_cursor,
             ..ThreadHistoryPagination::default()
         };
@@ -465,6 +510,10 @@ impl AppServerSession {
         let mut scanned_items = 0;
         let mut rendered_rows = 0;
         while let Some(limit) = budget.next_page_size(rendered_rows, scanned_items) {
+            if anchored && state.next_item_cursor.is_none() {
+                break;
+            }
+
             let page = self
                 .thread_items_page(
                     thread_id,
@@ -474,6 +523,19 @@ impl AppServerSession {
                 )
                 .await?;
             if page.data.is_empty() {
+                state.next_item_cursor = advancing_cursor(
+                    state.next_item_cursor.as_deref(),
+                    page.next_cursor,
+                    &mut state.seen_item_cursors,
+                );
+                if self.thread_params_mode() == super::ThreadParamsMode::Cloud
+                    && state.next_item_cursor.is_some()
+                {
+                    // Unknown native items may fill a page; preserve its continuation
+                    // and charge the requested page against the existing scan budget.
+                    scanned_items = scanned_items.saturating_add(limit as usize);
+                    continue;
+                }
                 state.next_item_cursor = None;
                 break;
             }
@@ -491,11 +553,13 @@ impl AppServerSession {
             {
                 break;
             }
-            // Height measurement renders and highlights the page. An uncapped load has no row
-            // budget to satisfy, so leave formatting to the eventual parallel transcript render.
-            if budget.rows.is_some()
-                && let Some((config, local_settings)) = config.zip(local_settings)
-            {
+            if state.next_item_cursor.is_none() {
+                break;
+            }
+            if budget.rows.is_none() {
+                continue;
+            }
+            if let Some((config, local_settings)) = config.zip(local_settings) {
                 rendered_rows = rendered_history_rows(
                     thread_id,
                     thread,
@@ -508,10 +572,24 @@ impl AppServerSession {
             } else {
                 rendered_rows = rendered_rows.saturating_add(items.len());
             }
-            if state.next_item_cursor.is_none() {
-                break;
+        }
+        // A failed Cloud turn may have only an error and no items.
+        if self.thread_params_mode() == super::ThreadParamsMode::Cloud
+            && scope == HistoryHydrationScope::FullTranscript
+        {
+            while let Some(cursor) = state.next_turn_cursor.take() {
+                let page = self
+                    .thread_turns_page(thread_id, Some(cursor.clone()), HISTORY_TURN_PAGE_LIMIT)
+                    .await?;
+                state.next_turn_cursor = advancing_cursor(
+                    Some(&cursor),
+                    page.next_cursor,
+                    &mut state.seen_turn_cursors,
+                );
+                prepend_older_turns(&mut thread.turns, page.data);
             }
         }
+        mark_loaded_interruptions(&mut thread.turns, state.next_item_cursor.as_deref());
         if config.is_some() {
             self.history_pagination.insert(thread_id, state);
         }
