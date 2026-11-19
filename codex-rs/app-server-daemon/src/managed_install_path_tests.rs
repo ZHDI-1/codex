@@ -64,6 +64,27 @@ fn discovers_package_and_legacy_installs() {
 
 #[cfg(unix)]
 #[test]
+fn downstream_revisions_require_both_the_compiled_channel_and_latest_marker() {
+    let home = tempfile::TempDir::new().expect("home");
+    let root = home.path().join("packages/app-server-daemon");
+    let release_name = "0.166.0+patched.12-x86_64-unknown-linux-musl";
+    let release = root.join("releases").join(release_name);
+    let binary = release.join("bin/codex");
+    std::fs::create_dir_all(binary.parent().expect("bin directory")).expect("release");
+    std::fs::write(&binary, b"test package").expect("binary");
+    std::os::unix::fs::symlink(&release, root.join("current")).expect("selection");
+    let marker = root.join("auto-update-version");
+    std::fs::write(&marker, release_name).expect("latest marker");
+    assert_eq!(
+        super::is_stable_standalone_release(home.path(), &binary),
+        codex_install_context::release_channel::is_downstream()
+    );
+    std::fs::remove_file(marker).expect("pin release");
+    assert!(!super::is_stable_standalone_release(home.path(), &binary));
+}
+
+#[cfg(unix)]
+#[test]
 fn updater_only_runs_for_stable_installer_owned_releases() {
     let home = tempfile::TempDir::new().expect("home");
     let state = home.path().join("app-server-daemon");

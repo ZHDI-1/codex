@@ -59,7 +59,8 @@ jobs:
   build:
     needs: tag-check
     name: Build - ${{ matrix.runner }} - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
-    # Release Cargo artifacts only while Bazel releases are disabled.
+    # Parallel Bazel artifacts are advisory while Cargo remains the release path.
+    continue-on-error: ${{ matrix.build-system == 'bazel' }}
     runs-on: ${{ matrix.runner }}
     environment:
       name: bazel
@@ -83,7 +84,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build-system: [cargo] # Bazel releases are disabled while the BuildBuddy key is revoked.
+        build-system: [cargo, bazel]
         target:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
@@ -208,7 +209,6 @@ jobs:
         name: Install musl build tools
         env:
           TARGET: ${{ matrix.target }}
-          CODEX_MUSL_RELEASE_LINK_FLAGS: "1"
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
 
       - if: ${{ matrix.build-system == 'cargo' && contains(matrix.target, 'linux') }}
@@ -278,6 +278,8 @@ jobs:
       - name: Build Bazel release binaries and symbols
         if: ${{ matrix.build-system == 'bazel' }}
         uses: ./.github/actions/build-bazel-release
+        env:
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         with:
           target: ${{ matrix.target }}
           bundle: ${{ matrix.bundle }}
@@ -325,7 +327,7 @@ jobs:
         shell: bash
         env:
           APP_TARGET: ${{ matrix.target }}
-          # Use local Bazel while BuildBuddy credentials are unavailable.
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
@@ -604,7 +606,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           PREFIX: ${{ matrix.prefix }}
-          # Use local Bazel while BuildBuddy credentials are unavailable.
+          BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
         run: |
           set -euo pipefail
           # Release tags bump Cargo.toml without rewriting the workspace lockfile.
@@ -635,6 +637,7 @@ jobs:
     needs: [build, build-macos-voice]
     if: ${{ always() && needs.build.result == 'success' && needs.build-macos-voice.result == 'success' }}
     name: Sign macOS binaries - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
+    continue-on-error: ${{ matrix.build-system == 'bazel' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment:
@@ -650,7 +653,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build-system: [cargo] # Bazel releases are disabled while the BuildBuddy key is revoked.
+        build-system: [cargo, bazel]
         target:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
@@ -880,6 +883,7 @@ jobs:
   package-macos:
     needs: sign-macos-binaries
     name: Package macOS artifacts - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
+    continue-on-error: ${{ matrix.build-system == 'bazel' }}
     runs-on: macos-15-xlarge
     timeout-minutes: 45
     permissions:
@@ -894,7 +898,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build-system: [cargo] # Bazel releases are disabled while the BuildBuddy key is revoked.
+        build-system: [cargo, bazel]
         target:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
@@ -1167,6 +1171,7 @@ jobs:
   sign-macos-dmg:
     needs: package-macos
     name: Sign macOS DMG - ${{ matrix.target }} - ${{ matrix.build-system }}
+    continue-on-error: ${{ matrix.build-system == 'bazel' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment:
@@ -1182,7 +1187,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build-system: [cargo] # Bazel releases are disabled while the BuildBuddy key is revoked.
+        build-system: [cargo, bazel]
         target:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
@@ -1271,6 +1276,7 @@ jobs:
       - package-macos
       - sign-macos-dmg
     name: Verify macOS artifacts - ${{ matrix.target }} - ${{ matrix.bundle }} - ${{ matrix.build-system }}
+    continue-on-error: ${{ matrix.build-system == 'bazel' }}
     runs-on: macos-15-xlarge
     timeout-minutes: 30
     permissions:
@@ -1285,7 +1291,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build-system: [cargo] # Bazel releases are disabled while the BuildBuddy key is revoked.
+        build-system: [cargo, bazel]
         target:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
@@ -1675,7 +1681,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
-          pattern: "{{aarch64,x86_64}-{apple-darwin{,-app-server},unknown-linux-musl{,-app-server},pc-windows-msvc},*-symbols,argument-comment-lint-*,python-runtime-wheel-*,npm-packages}"
+          pattern: "{{aarch64,x86_64}-{apple-darwin{,-app-server},unknown-linux-musl{,-app-server},pc-windows-msvc}{,-bazel},*-symbols{,-bazel},argument-comment-lint-*,python-runtime-wheel-*,npm-packages}"
 
       - name: Download verified provisioned macOS packages
         if: vars.CODEX_PROVISIONED_MACOS_CANDIDATE == 'true'
@@ -1769,7 +1775,39 @@ jobs:
           RELEASE_NOTES: ${{ steps.release_notes.outputs.path }}
           MAKE_LATEST: ${{ steps.release_name.outputs.make_latest }}
           PRERELEASE: ${{ steps.release_name.outputs.prerelease }}
-        run: bash .github/scripts/publish-github-release.sh
+        run: |
+          set -euo pipefail
+
+          # Look up this tag, including drafts, without listing release history.
+          # API errors must fail the step rather than look like an absent release.
+          # shellcheck disable=SC2016
+          exists="$(gh api graphql \
+            -f query='query($owner:String!,$repo:String!,$tag:String!){repository(owner:$owner,name:$repo){release(tagName:$tag){databaseId}}}' \
+            -f owner="$GITHUB_REPOSITORY_OWNER" \
+            -f repo="${GITHUB_REPOSITORY#*/}" \
+            -f tag="$GITHUB_REF_NAME" \
+            --jq '.data.repository.release != null')"
+          release_args=(
+            --repo "$GITHUB_REPOSITORY"
+            --title "$RELEASE_NAME"
+            --notes-file "$RELEASE_NOTES"
+            --prerelease="$PRERELEASE"
+          )
+          if [[ "$exists" == false ]]; then
+            # Prereleases must be created directly to keep prereleased events.
+            draft=true
+            if [[ "$PRERELEASE" == true ]]; then
+              draft=false
+            fi
+            gh release create "$GITHUB_REF_NAME" "${release_args[@]}" \
+              --draft="$draft" --verify-tag --latest=false
+          fi
+
+          mapfile -d '' assets < <(find dist -type f -print0 | sort -z)
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$GITHUB_REF_NAME" "${release_args[@]}" \
+            --draft=false --latest="$MAKE_LATEST"
 
   publish-r2-assets:
     name: publish-r2-assets

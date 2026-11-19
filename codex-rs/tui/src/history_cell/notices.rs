@@ -81,7 +81,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
             Line::from(update_instruction),
             Line::from(""),
             Line::from("See full release notes:"),
-            Line::from("https://github.com/openai/codex/releases/latest"),
+            Line::from(codex_install_context::release_channel::RELEASE_NOTES_URL),
         ]
     }
 

@@ -1,6 +1,6 @@
 //! Bounded app-server transcript loading for resume, fork, and transcript views.
 
-use codex_app_server_protocol::ThreadItem;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use super::AppServerSession;
@@ -14,6 +14,8 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemEntry;
 use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadItemsListCursor;
 use codex_app_server_protocol::ThreadItemsListParams;
@@ -155,6 +157,51 @@ fn mark_loaded_interruptions(turns: &mut [Turn], older_cursor: Option<&str>) {
     }
 }
 
+/// Prepend a descending item page with one move of each affected turn's retained suffix.
+///
+/// Keep the first copy of overlapping items, including duplicates within this page. The returned
+/// payloads retain the page's global chronological order even when its turns are interleaved.
+fn merge_item_page_into_turns(
+    turns: &mut [Turn],
+    page: Vec<ThreadItemEntry>,
+) -> Result<Vec<ThreadItemPayload>> {
+    let mut by_turn: HashMap<String, Vec<(usize, ThreadItemEntry)>> = HashMap::new();
+    for (index, entry) in page.into_iter().enumerate() {
+        by_turn
+            .entry(entry.turn_id.clone())
+            .or_default()
+            .push((index, entry));
+    }
+    let mut added = Vec::new();
+    for turn in turns {
+        let Some(incoming) = by_turn.remove(&turn.id) else {
+            continue;
+        };
+        let keep: Vec<bool> = {
+            let mut seen: HashSet<&str> = turn.items.iter().map(ThreadItem::id).collect();
+            incoming
+                .iter()
+                .map(|(_, entry)| seen.insert(entry.item.id()))
+                .collect()
+        };
+        let mut older = Vec::new();
+        for ((index, entry), keep) in incoming.into_iter().zip(keep) {
+            if keep {
+                let item = ThreadItem::try_from(entry)?;
+                added.push((index, item.payload.clone()));
+                older.push(item);
+            }
+        }
+        if !older.is_empty() {
+            older.reverse();
+            turn.items.splice(0..0, older);
+            turn.items_view = TurnItemsView::Summary;
+        }
+    }
+    added.sort_unstable_by_key(|(index, _)| std::cmp::Reverse(*index));
+    Ok(added.into_iter().map(|(_, payload)| payload).collect())
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ThreadHistoryPagination {
     pub(super) history_mode: ThreadHistoryMode,
@@ -166,6 +213,81 @@ pub(crate) struct ThreadHistoryPagination {
 }
 
 impl AppServerSession {
+    /// Validate a displayed prompt without downloading the tool-heavy history window again.
+    /// Turn metadata guards the same tail identity as the full-history path. Reading the
+    /// selected turn from its beginning proves that this item is not a mid-turn steer.
+    pub(crate) async fn prompt_edit_turn(
+        &mut self,
+        thread_id: ThreadId,
+        turn_id: &str,
+        item_id: &str,
+        expected_latest_turn_id: Option<&str>,
+    ) -> Result<Turn> {
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        let mut turn = loop {
+            let page = self
+                .thread_turns_page(thread_id, cursor.clone(), HISTORY_ITEM_PAGE_LIMIT)
+                .await?;
+            if cursor.is_none()
+                && page.data.first().map(|turn| turn.id.as_str()) != expected_latest_turn_id
+            {
+                color_eyre::eyre::bail!(
+                    "thread history changed; reload the session before editing this prompt"
+                );
+            }
+            if let Some(turn) = page.data.into_iter().find(|turn| turn.id == turn_id) {
+                break turn;
+            }
+            cursor = advancing_cursor(cursor.as_deref(), page.next_cursor, &mut seen);
+            if cursor.is_none() {
+                color_eyre::eyre::bail!("the selected turn no longer exists");
+            }
+        };
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        loop {
+            let request_id = self.next_request_id();
+            let page: ThreadItemsListResponse = self
+                .request_handle
+                .request_typed(ClientRequest::ThreadItemsList {
+                    request_id,
+                    params: ThreadItemsListParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: Some(turn_id.to_string()),
+                        cursor: cursor.clone().map(ThreadItemsListCursor::Opaque),
+                        // The normal first item is the prompt: avoid transferring any tool
+                        // output at all. Unusual leading items continue in bounded pages.
+                        limit: Some(if cursor.is_none() {
+                            1
+                        } else {
+                            HISTORY_ITEM_PAGE_LIMIT
+                        }),
+                        sort_direction: Some(SortDirection::Asc),
+                        defer_output: None,
+                    },
+                })
+                .await?;
+            for entry in page.data {
+                if matches!(&entry.item.payload, ThreadItemPayload::UserMessage { .. }) {
+                    if entry.item.id() != item_id {
+                        color_eyre::eyre::bail!(
+                            "the selected prompt is a steer and cannot be edited independently"
+                        );
+                    }
+                    turn.items = vec![entry.item];
+                    return Ok(turn);
+                }
+            }
+            cursor = advancing_cursor(cursor.as_deref(), page.next_cursor, &mut seen);
+            if cursor.is_none() {
+                color_eyre::eyre::bail!(
+                    "the selected prompt was not found in the persisted thread"
+                );
+            }
+        }
+    }
+
     pub(crate) async fn revert_thread(
         &mut self,
         thread_id: ThreadId,
@@ -316,39 +438,27 @@ impl AppServerSession {
             .filter(|entry| !turns.iter().any(|turn| turn.id == entry.turn_id))
             .map(|entry| entry.turn_id.clone())
             .collect::<HashSet<_>>();
-        let mut items = Vec::new();
-        for entry in page.data {
-            while !turns.iter().any(|turn| turn.id == entry.turn_id) {
-                let Some(cursor) = state.next_turn_cursor.take() else {
-                    break;
-                };
-                // Fetch only the remaining item-backed turns so metadata does not run ahead
-                // of this page. Empty turns between them may require another bounded request.
-                let limit = missing_turn_ids.len().min(HISTORY_ITEM_PAGE_LIMIT as usize) as u32;
-                let page = self
-                    .thread_turns_page(thread_id, Some(cursor.clone()), limit)
-                    .await?;
-                state.next_turn_cursor = advancing_cursor(
-                    Some(&cursor),
-                    page.next_cursor,
-                    &mut state.seen_turn_cursors,
-                );
-                for turn in &page.data {
-                    missing_turn_ids.remove(&turn.id);
-                }
-                prepend_older_turns(turns, page.data);
+        while !missing_turn_ids.is_empty() {
+            let Some(cursor) = state.next_turn_cursor.take() else {
+                break;
+            };
+            // Fetch only the remaining item-backed turns so metadata does not run ahead
+            // of this page. Empty turns between them may require another bounded request.
+            let limit = missing_turn_ids.len().min(HISTORY_ITEM_PAGE_LIMIT as usize) as u32;
+            let page = self
+                .thread_turns_page(thread_id, Some(cursor.clone()), limit)
+                .await?;
+            state.next_turn_cursor = advancing_cursor(
+                Some(&cursor),
+                page.next_cursor,
+                &mut state.seen_turn_cursors,
+            );
+            for turn in &page.data {
+                missing_turn_ids.remove(&turn.id);
             }
-            if let Some(turn) = turns.iter_mut().find(|turn| turn.id == entry.turn_id)
-                && !turn.items.iter().any(|item| item.id() == entry.item.id())
-            {
-                let item = ThreadItem::try_from(entry)?;
-                items.push(item.payload.clone());
-                turn.items.insert(/*index*/ 0, item);
-                turn.items_view = TurnItemsView::Summary;
-            }
+            prepend_older_turns(turns, page.data);
         }
-        items.reverse();
-        Ok(items)
+        merge_item_page_into_turns(turns, page.data)
     }
 
     /// Hydrates paginated threads through bounded turn and item pages.
@@ -506,18 +616,35 @@ fn rendered_history_rows(
     } else {
         HistoryRenderMode::Rich
     };
-    thread_items_to_transcript_cells(
+    let cells = thread_items_to_transcript_cells(
         Some(thread_id),
         &thread.cwd,
         items,
         visibility,
         Some(config),
-    )
-    .into_iter()
-    .fold(rendered_rows, |rows, cell| {
-        let height = usize::from(cell.desired_height_for_mode(width, mode));
-        rows + height + usize::from(height != 0 && rows != 0 && !cell.is_stream_continuation())
-    })
+    );
+    rendered_cell_rows(&cells, width, mode, rendered_rows)
+}
+
+fn rendered_cell_rows(
+    cells: &[std::sync::Arc<dyn crate::history_cell::HistoryCell>],
+    width: u16,
+    mode: HistoryRenderMode,
+    rendered_rows: usize,
+) -> usize {
+    let heights = crate::history_render::map_cells(cells, |cell| {
+        (
+            usize::from(cell.desired_height_for_mode(width, mode)),
+            cell.is_stream_continuation(),
+        )
+    });
+    // Keep accounting ordered: empty cells add no separator, the first visible cell has
+    // no leading separator, and a continuation never starts a new separated block.
+    heights
+        .into_iter()
+        .fold(rendered_rows, |rows, (height, continuation)| {
+            rows + height + usize::from(height != 0 && rows != 0 && !continuation)
+        })
 }
 
 #[cfg(test)]

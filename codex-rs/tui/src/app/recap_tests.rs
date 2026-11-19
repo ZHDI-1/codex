@@ -58,6 +58,7 @@ fn turn(status: TurnStatus) -> Turn {
 
 fn user_history_cell(message: &str) -> Arc<dyn HistoryCell> {
     Arc::new(UserHistoryCell {
+        item_id: Default::default(),
         message: message.to_string(),
         presentation: Default::default(),
         text_elements: Vec::new(),

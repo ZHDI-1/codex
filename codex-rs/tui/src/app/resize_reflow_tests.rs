@@ -22,6 +22,48 @@ fn rendered_line_text(line: &HyperlinkLine) -> String {
 }
 
 #[tokio::test]
+async fn resize_reflow_preserves_latest_clear_boundary_for_capped_and_unlimited_history() {
+    for max_rows in [0, 4096] {
+        let mut app = make_test_app().await;
+        app.local_settings.tui.terminal_resize_reflow_max_rows = Some(max_rows);
+        app.scrollback_has_older_history = true;
+        let header = || {
+            Arc::new(history_cell::ClearScreenHeader(
+                history_cell::SessionHeaderHistoryCell::new(
+                    "gpt-test".to_string(),
+                    None,
+                    std::path::PathBuf::from("/tmp"),
+                    "test",
+                ),
+            )) as Arc<dyn HistoryCell>
+        };
+        let plain = |text: &'static str| {
+            Arc::new(PlainHistoryCell::new(vec![Line::from(text)])) as Arc<dyn HistoryCell>
+        };
+        app.transcript_cells = vec![
+            plain("before first clear"),
+            header(),
+            plain("before latest clear"),
+            header(),
+            plain("visible after clear"),
+        ];
+        let rendered = app.render_transcript_lines_for_reflow(80);
+        let text = rendered
+            .lines
+            .iter()
+            .map(rendered_line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("OpenAI Codex"));
+        assert!(text.contains("visible after clear"));
+        assert!(!text.contains("before first clear"));
+        assert!(!text.contains("before latest clear"));
+        assert_eq!(app.transcript_cells.len(), 5);
+        assert!(!app.scrollback_history_needs_top_up(0));
+    }
+}
+
+#[tokio::test]
 async fn resize_reflow_preserves_configured_scrollback_beyond_the_visible_viewport() {
     let mut app = make_test_app().await;
     app.local_settings.tui.terminal_resize_reflow_max_rows = Some(32);
@@ -59,6 +101,7 @@ async fn initial_resume_replay_retains_scrollback_beyond_the_visible_viewport() 
     app.begin_initial_history_replay_buffer();
     let mut tui = crate::tui::test_support::make_test_tui()?;
     for cell in plain_history_cells(/*count*/ 24) {
+        app.transcript_cells.push(cell.clone());
         app.insert_history_cell_lines_with_initial_replay_buffer(
             &mut tui,
             cell.as_ref(),
@@ -66,17 +109,25 @@ async fn initial_resume_replay_retains_scrollback_beyond_the_visible_viewport() 
         );
     }
 
-    let retained_lines = &app
+    let buffer = app
         .initial_history_replay_buffer
         .as_ref()
-        .expect("initial replay buffer should remain active")
-        .retained_lines;
+        .expect("initial replay buffer should remain active");
+    assert!(buffer.render_from_transcript_tail);
+    assert!(
+        buffer.retained_lines.is_empty(),
+        "replay should defer cell formatting"
+    );
+    app.finish_initial_history_replay_buffer(&mut tui);
+    assert!(app.transcript_reflow.has_pending_reflow());
+    let rendered = app.render_transcript_lines_for_reflow(screen_size.width);
+    let retained_lines = &rendered.lines;
     assert_eq!(retained_lines.len(), 32);
     assert!(retained_lines.len() > usize::from(visible_history_rows));
-    assert!(
-        app.initial_history_replay_buffer
-            .as_ref()
-            .is_some_and(|buffer| buffer.was_truncated)
+    assert_eq!(
+        app.transcript_cells.len(),
+        24,
+        "row cap must not truncate source history"
     );
     insta::assert_snapshot!(
         retained_lines

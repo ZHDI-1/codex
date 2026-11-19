@@ -1,12 +1,309 @@
 use super::HistoryHydrationScope;
 use super::HistoryLoadBudget;
 use super::advancing_cursor;
+use super::merge_item_page_into_turns;
+use super::rendered_cell_rows;
+use crate::history_cell::HistoryCell;
+use crate::history_cell::HistoryRenderMode;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::legacy_core::config::TerminalResizeReflowMaxRows;
 use crate::local_settings::LocalSettings;
 use codex_config::types::AltScreenMode;
 use pretty_assertions::assert_eq;
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+#[test]
+fn older_item_pages_preserve_order_overlap_timestamps_and_live_turn_state() -> color_eyre::Result<()>
+{
+    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadItemEntry;
+    use codex_app_server_protocol::ThreadItemPayload;
+    use codex_app_server_protocol::Turn;
+    use codex_app_server_protocol::TurnItemsView;
+    use codex_app_server_protocol::TurnStatus;
+
+    let entry = |turn_id: &str, item_id: &str, started_at_ms| ThreadItemEntry {
+        turn_id: turn_id.to_string(),
+        item: ThreadItem::untimed(ThreadItemPayload::UserMessage {
+            id: item_id.to_string(),
+            client_id: None,
+            content: Vec::new(),
+        }),
+        started_at_ms: Some(started_at_ms),
+        completed_at_ms: Some(started_at_ms + 1),
+        output_deferred: false,
+    };
+    let make_turn = |id: &str, items: Vec<ThreadItem>| Turn {
+        id: id.to_string(),
+        root_turn_id: Some("root".to_string()),
+        items,
+        items_view: TurnItemsView::Full,
+        status: TurnStatus::InProgress,
+        error: None,
+        started_at: Some(1),
+        completed_at: None,
+        duration_ms: None,
+    };
+    let mut turns = vec![
+        make_turn("a", vec![ThreadItem::try_from(entry("a", "live", 7))?]),
+        make_turn("b", Vec::new()),
+        make_turn("c", vec![ThreadItem::try_from(entry("c", "overlap", 8))?]),
+    ];
+    let added = merge_item_page_into_turns(
+        &mut turns,
+        vec![
+            entry("b", "b1", 30),
+            entry("a", "a2", 20),
+            entry("b", "b1", 99),
+            entry("a", "live", 99),
+            entry("a", "a1", 10),
+            entry("missing", "ignored", 1),
+            entry("c", "overlap", 99),
+        ],
+    )?;
+    assert_eq!(
+        added.iter().map(ThreadItemPayload::id).collect::<Vec<_>>(),
+        ["a1", "a2", "b1"],
+    );
+    assert_eq!(
+        turns[0]
+            .items
+            .iter()
+            .map(ThreadItem::id)
+            .collect::<Vec<_>>(),
+        ["a1", "a2", "live"],
+    );
+    assert_eq!(turns[0].items[2].started_at_ms, Some(7));
+    assert_eq!(turns[1].items[0].started_at_ms, Some(30));
+    assert_eq!(turns[1].items[0].completed_at_ms, Some(31));
+    assert_eq!(turns[0].items_view, TurnItemsView::Summary);
+    assert_eq!(turns[2].items_view, TurnItemsView::Full);
+    assert_eq!(turns[2].items[0].started_at_ms, Some(8));
+    for turn in turns {
+        assert_eq!(turn.status, TurnStatus::InProgress);
+        assert_eq!(turn.root_turn_id.as_deref(), Some("root"));
+        assert_eq!(turn.started_at, Some(1));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompt_edit_reads_only_the_selected_prompt_and_rejects_stale_or_steered_selections()
+-> color_eyre::Result<()> {
+    use crate::app_server_session::AppServerSession;
+    use crate::app_server_session::ThreadParamsMode;
+    use codex_app_server_protocol::JSONRPCMessage;
+    use codex_protocol::ThreadId;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for (latest, first_item, error) in [
+        ("selected-turn", "selected-item", None),
+        (
+            "changed-turn",
+            "selected-item",
+            Some("thread history changed"),
+        ),
+        ("selected-turn", "earlier-input", Some("steer")),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = crate::resolve_remote_addr(&format!("ws://{}", listener.local_addr()?))?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            let mut requests = Vec::new();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let JSONRPCMessage::Request(request) = serde_json::from_str(&text)? else {
+                    continue;
+                };
+                let mut reply = match request.method.as_str() {
+                    "initialize" => json!({"result": {"userAgent": "prompt-edit-test/1.0"}}),
+                    "thread/turns/list" => {
+                        requests.push((request.method, request.params.unwrap()));
+                        json!({"result": {"data": [{
+                            "id": latest, "items": [], "status": "completed"
+                        }], "nextCursor": null, "backwardsCursor": null}})
+                    }
+                    "thread/items/list" => {
+                        let params = request.params.unwrap();
+                        assert_eq!(params["turnId"], "selected-turn");
+                        assert_eq!(params["sortDirection"], "asc");
+                        assert_eq!(params["limit"], 1);
+                        requests.push((request.method, params));
+                        json!({"result": {"data": [{
+                            "turnId": "selected-turn", "item": {
+                                "type": "userMessage", "id": first_item,
+                                "content": [{"type": "text", "text": "selected prompt", "textElements": []}]
+                            }
+                        }], "nextCursor": null, "backwardsCursor": null}})
+                    }
+                    method => panic!("unexpected prompt-edit request: {method}"),
+                };
+                reply["id"] = json!(request.id);
+                socket.send(Message::Text(reply.to_string().into())).await?;
+            }
+            Ok::<_, color_eyre::Report>(requests)
+        });
+        let mut session = AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            crate::connect_remote_app_server(endpoint).await?,
+            ThreadParamsMode::Embedded,
+        );
+        let result = session
+            .prompt_edit_turn(
+                ThreadId::new(),
+                "selected-turn",
+                "selected-item",
+                Some("selected-turn"),
+            )
+            .await;
+        if let Some(error) = error {
+            assert!(format!("{:#}", result.unwrap_err()).contains(error));
+        } else {
+            let turn = result?;
+            assert_eq!(turn.id, "selected-turn");
+            assert_eq!(turn.items.len(), 1);
+            assert_eq!(turn.items[0].id(), "selected-item");
+        }
+        session.shutdown().await?;
+        let requests = server.await??;
+        assert_eq!(requests.len(), if latest == "changed-turn" { 1 } else { 2 });
+    }
+    Ok(())
+}
+
+#[test]
+fn older_item_pages_reject_deferred_outputs_but_ignore_existing_and_unknown_items()
+-> color_eyre::Result<()> {
+    use codex_app_server_protocol::DeferredItemOutput;
+    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::ThreadItemEntry;
+    use codex_app_server_protocol::ThreadItemPayload;
+    use codex_app_server_protocol::Turn;
+
+    let mut turns: Vec<Turn> = serde_json::from_value(serde_json::json!([{
+        "id": "turn",
+        "status": "inProgress",
+        "items": [{ "type": "userMessage", "id": "existing", "content": [] }]
+    }]))?;
+    let entry = |turn_id: &str, item_id: &str| ThreadItemEntry {
+        turn_id: turn_id.to_owned(),
+        item: ThreadItem::untimed(ThreadItemPayload::UserMessage {
+            id: item_id.to_owned(),
+            client_id: None,
+            content: Vec::new(),
+        }),
+        output_deferred: true,
+        started_at_ms: None,
+        completed_at_ms: None,
+    };
+    let added = merge_item_page_into_turns(
+        &mut turns,
+        vec![entry("turn", "existing"), entry("unknown", "ignored")],
+    )?;
+    assert!(added.is_empty());
+    let error = merge_item_page_into_turns(&mut turns, vec![entry("turn", "deferred")])
+        .expect_err("incomplete output must not become a rendered history item");
+    let error = error.downcast_ref::<DeferredItemOutput>().unwrap();
+    assert_eq!(error.turn_id, "turn");
+    assert_eq!(error.item_id, "deferred");
+    assert_eq!(turns[0].items.len(), 1);
+    assert_eq!(turns[0].items[0].id(), "existing");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct HeightMeasuredCell {
+    height: u16,
+    continuation: bool,
+    calls: Arc<Mutex<Vec<(u16, HistoryRenderMode, String)>>>,
+}
+
+impl HistoryCell for HeightMeasuredCell {
+    fn raw_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+        unreachable!("height measurement should use the cell's mode-aware height")
+    }
+
+    fn display_lines(&self, _width: u16) -> Vec<ratatui::text::Line<'static>> {
+        unreachable!("height measurement should use the cell's mode-aware height")
+    }
+
+    fn desired_height_for_mode(&self, width: u16, mode: HistoryRenderMode) -> u16 {
+        self.calls.lock().unwrap().push((
+            width,
+            mode,
+            std::thread::current().name().unwrap_or("").to_owned(),
+        ));
+        self.height
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        self.continuation
+    }
+}
+
+#[test]
+fn parallel_page_heights_preserve_empty_cells_continuations_and_prior_rows() {
+    for mode in [HistoryRenderMode::Rich, HistoryRenderMode::Raw] {
+        for prior_rows in [0, 11] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let cells: Vec<Arc<dyn HistoryCell>> = (0..8)
+                .flat_map(|_| {
+                    [
+                        (0, false),
+                        (0, true),
+                        (2, false),
+                        (0, false),
+                        (3, true),
+                        (1, false),
+                        (0, true),
+                        (4, false),
+                    ]
+                })
+                .map(|(height, continuation)| {
+                    Arc::new(HeightMeasuredCell {
+                        height,
+                        continuation,
+                        calls: calls.clone(),
+                    }) as Arc<dyn HistoryCell>
+                })
+                .collect();
+            let rows = rendered_cell_rows(&cells, 74, mode, prior_rows);
+            // Eight groups each add ten content rows and three block separators;
+            // only an initially empty transcript omits its first separator.
+            assert_eq!(rows, prior_rows + 80 + 24 - usize::from(prior_rows == 0));
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 64);
+            assert!(calls.iter().all(|(width, actual_mode, thread)| {
+                *width == 74 && *actual_mode == mode && thread.starts_with("codex-history-")
+            }));
+        }
+    }
+}
+
+#[test]
+fn empty_and_small_pages_keep_height_accounting_without_worker_dispatch() {
+    assert_eq!(rendered_cell_rows(&[], 80, HistoryRenderMode::Rich, 11), 11);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let cells: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(HeightMeasuredCell {
+        height: 3,
+        continuation: false,
+        calls: calls.clone(),
+    })];
+    assert_eq!(
+        rendered_cell_rows(&cells, 80, HistoryRenderMode::Raw, 11),
+        15
+    );
+    let current = std::thread::current();
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2, current.name().unwrap_or(""));
+}
 
 #[test]
 fn advancing_cursor_rejects_repeated_cursors() {
@@ -91,4 +388,26 @@ async fn owned_initial_history_stops_after_viewport_or_scan_budget() {
             [Some(30), None],
         );
     }
+}
+
+#[tokio::test]
+async fn uncapped_native_history_has_no_height_measurement_budget() {
+    let codex_home = tempfile::tempdir().unwrap();
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .unwrap();
+    config.tui_fullscreen_transcript = false;
+    config.terminal_resize_reflow.max_rows = TerminalResizeReflowMaxRows::Disabled;
+    let local_settings = LocalSettings::from(&config);
+    let budget = HistoryLoadBudget::new(
+        HistoryHydrationScope::Initial,
+        Some(&config),
+        Some(&local_settings),
+        24,
+    );
+    assert_eq!(budget.rows, None);
+    assert_eq!(budget.items, None);
+    assert_eq!(budget.next_page_size(100_000, 100_000), Some(100));
 }

@@ -55,6 +55,7 @@ impl AppEventSender {
                     | AppEvent::RealtimeConversationStateChanged
                     | AppEvent::BackgroundVoiceError { .. }
                     | AppEvent::SyncThreadGitBranch { .. }
+                    | AppEvent::HistoryReflowReady { .. }
                     | AppEvent::RefreshRateLimits { .. }
             )
         {
