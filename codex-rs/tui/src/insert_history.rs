@@ -7,6 +7,7 @@
 use std::fmt;
 use std::io;
 use std::io::Write;
+use std::sync::Arc;
 
 use crate::custom_terminal::ModifierDiff;
 use crate::render::line_utils::line_to_static;
@@ -60,17 +61,19 @@ pub(crate) enum InsertHistoryMode {
 
 /// Width-specific wrapping and ANSI encoding, prepared without touching the terminal. Retain the
 /// source until emission so an intervening resize can still use the normal wrapping path.
+/// Shared buffers allow unchanged history to be replayed without copying or highlighting it again.
+#[derive(Clone)]
 pub(crate) struct PreparedHistory {
-    pub(crate) source: Vec<HyperlinkLine>,
+    pub(crate) source: Arc<Vec<HyperlinkLine>>,
     width: u16,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     wrapped_rows: usize,
 }
 
 impl PreparedHistory {
     fn write(&self, writer: &mut impl Write, mode: InsertHistoryMode) -> io::Result<()> {
         let bytes = match mode {
-            InsertHistoryMode::Standard => &self.bytes,
+            InsertHistoryMode::Standard => self.bytes.as_slice(),
             InsertHistoryMode::FullScreen => self.bytes.get(2..).unwrap_or_default(),
         };
         writer.write_all(bytes)
@@ -106,9 +109,9 @@ pub(crate) fn prepare_history_hyperlink_lines(
         wrapped_rows += rows;
     }
     Ok(PreparedHistory {
-        source,
+        source: source.into(),
         width: width.max(1),
-        bytes,
+        bytes: bytes.into(),
         wrapped_rows,
     })
 }
@@ -529,7 +532,7 @@ mod tests {
                 sequential.extend_from_slice(b"\r\n");
                 write_history_line(&mut sequential, line, 31).unwrap();
             }
-            assert_eq!(prepared.bytes, sequential);
+            assert_eq!(prepared.bytes.as_ref(), &sequential);
             assert_eq!(prepared.wrapped_rows, rows);
         }
     }

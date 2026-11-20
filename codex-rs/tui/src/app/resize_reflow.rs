@@ -60,7 +60,7 @@ struct ReflowCellDisplay {
 /// This is intentionally line-oriented rather than cell-oriented because the terminal only accepts
 /// already-wrapped rows. Callers should keep treating `transcript_cells` as the source of truth; the
 /// rows here are a transient render product for a single terminal width.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct ReflowRenderResult {
     pub(super) lines: Vec<HyperlinkLine>,
     history_was_truncated: bool,
@@ -93,10 +93,19 @@ struct ReflowJob {
     result: mpsc::Receiver<std::thread::Result<std::io::Result<Option<ReflowRenderResult>>>>,
 }
 
+struct CachedReflow {
+    key: ReflowKey,
+    sources: Vec<Weak<dyn HistoryCell>>,
+    result: ReflowRenderResult,
+}
+
 #[derive(Default)]
 pub(super) struct BackgroundReflow {
     next_id: u64,
     job: Option<ReflowJob>,
+    // One completed width is enough to reuse ANSI and wrapped rows during height-only resizes.
+    // PreparedHistory shares its large buffers with the UI instead of cloning them per replay.
+    cached: Option<CachedReflow>,
     unavailable: bool,
 }
 
@@ -113,13 +122,26 @@ impl Drop for BackgroundReflow {
 }
 
 impl BackgroundReflow {
+    fn discard_cached(&mut self) {
+        if let Some(cached) = self.cached.take() {
+            // Releasing a large snapshot's final shared buffers can also be expensive.
+            crate::history_render::spawn(move || drop(cached));
+        }
+    }
+
     pub(super) fn invalidate(&mut self) {
+        self.discard_cached();
+        self.cancel_pending();
+    }
+
+    fn cancel_pending(&mut self) {
         if let Some(job) = &self.job {
             job.cancelled.store(true, Ordering::Relaxed);
         }
     }
 
     pub(super) fn clear(&mut self) {
+        self.discard_cached();
         if let Some(job) = self.job.take() {
             job.cancelled.store(true, Ordering::Relaxed);
         }
@@ -141,6 +163,19 @@ impl BackgroundReflow {
         if sources.len() < BACKGROUND_REFLOW_MIN_CELLS || self.unavailable {
             self.clear();
             return PreparedReflow::Synchronous;
+        }
+        if let Some(cached) = &self.cached
+            && cached.key == key
+            && cached.sources.len() == sources.len()
+            && cached
+                .sources
+                .iter()
+                .zip(sources)
+                .all(|(old, current)| old.ptr_eq(&Arc::downgrade(current)))
+        {
+            let result = cached.result.clone();
+            self.cancel_pending();
+            return PreparedReflow::Ready(result);
         }
         let mut prefix = None;
         if let Some(job) = &self.job {
@@ -166,8 +201,16 @@ impl BackgroundReflow {
             match job.result.try_recv() {
                 Ok(Ok(Ok(Some(result)))) if matches => {
                     let rendered_count = job.sources.len();
-                    self.job = None;
+                    let Some(job) = self.job.take() else {
+                        unreachable!("received a result without a reflow job");
+                    };
                     if rendered_count == sources.len() {
+                        self.discard_cached();
+                        self.cached = Some(CachedReflow {
+                            key: job.key,
+                            sources: job.sources,
+                            result: result.clone(),
+                        });
                         return PreparedReflow::Ready(result);
                     }
                     prefix = Some((rendered_count, result));
@@ -199,7 +242,7 @@ impl BackgroundReflow {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> std::io::Result<_> {
                     let mut prefix = prefix.map(|(_, mut result)| {
                         if let Some(prepared) = result.prepared.take() {
-                            result.lines = prepared.source;
+                            result.lines = Arc::unwrap_or_clone(prepared.source);
                             // The old ANSI buffer is released here, off the UI thread.
                         }
                         result
@@ -567,7 +610,11 @@ impl App {
     }
 
     fn schedule_resize_reflow(&mut self, target_width: Option<u16>) -> bool {
-        self.background_reflow.invalidate();
+        // A height change does not change the wrapped rows or encoded ANSI. Keep completed work
+        // and any matching in-flight render; prepare() still validates source identity and theme.
+        if target_width.is_some() {
+            self.background_reflow.cancel_pending();
+        }
         self.transcript_reflow.schedule_debounced(target_width)
     }
 
@@ -1142,6 +1189,101 @@ mod background_reflow_tests {
     }
 
     #[tokio::test]
+    async fn completed_reflow_reuses_shared_buffers_and_checks_source_and_render_settings() {
+        let cell = Arc::new(GatedCell {
+            first: AtomicBool::new(false),
+            renders: AtomicUsize::new(0),
+            entered: Barrier::new(2),
+            released: Barrier::new(2),
+        });
+        let mut sources: Vec<Arc<dyn HistoryCell>> = (0..32).map(|_| cell.clone() as _).collect();
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let sender = crate::app_event_sender::AppEventSender::new(sender);
+        let mut state = BackgroundReflow::default();
+        let mut render_key = key(74);
+
+        for change in 0..6 {
+            match change {
+                1 => {
+                    sources[0] = Arc::new(TailCell {
+                        lines: vec![HyperlinkLine::from("replacement at the same index")],
+                        continuation: false,
+                    })
+                }
+                2 => render_key.theme_revision += 1,
+                3 => render_key.row_cap = Some(48),
+                4 => render_key.wrap_policy = HistoryLineWrapPolicy::Terminal,
+                5 => state.invalidate(), // Mutable cells can change behind the same Arc.
+                _ => {}
+            }
+            assert!(matches!(
+                state.prepare(&sources, render_key.clone(), &sender),
+                PreparedReflow::Pending
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .unwrap();
+            let PreparedReflow::Ready(first) = state.prepare(&sources, render_key.clone(), &sender)
+            else {
+                panic!("expected completed render");
+            };
+            let renders = cell.renders.load(Ordering::Relaxed);
+            // A height-only resize retains the same render key and sources.
+            let PreparedReflow::Ready(repeated) =
+                state.prepare(&sources, render_key.clone(), &sender)
+            else {
+                panic!("unchanged history must be immediately reusable");
+            };
+            assert!(Arc::ptr_eq(
+                &first.prepared.unwrap().source,
+                &repeated.prepared.unwrap().source,
+            ));
+            assert_eq!(cell.renders.load(Ordering::Relaxed), renders);
+            assert!(state.job.is_none());
+        }
+        state.clear();
+        assert!(state.cached.is_none());
+    }
+
+    #[tokio::test]
+    async fn height_only_resize_keeps_matching_in_flight_work() {
+        let mut app = crate::app::test_support::make_test_app().await;
+        let cell = Arc::new(GatedCell {
+            first: AtomicBool::new(true),
+            renders: AtomicUsize::new(0),
+            entered: Barrier::new(2),
+            released: Barrier::new(2),
+        });
+        let sources: Vec<Arc<dyn HistoryCell>> = (0..32).map(|_| cell.clone() as _).collect();
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let sender = crate::app_event_sender::AppEventSender::new(sender);
+        app.background_reflow.prepare(&sources, key(74), &sender);
+        cell.entered.wait();
+        app.schedule_resize_reflow(None);
+        let cancelled_by_height = app
+            .background_reflow
+            .job
+            .as_ref()
+            .unwrap()
+            .cancelled
+            .load(Ordering::Relaxed);
+        app.schedule_resize_reflow(Some(222));
+        let cancelled_by_width = app
+            .background_reflow
+            .job
+            .as_ref()
+            .unwrap()
+            .cancelled
+            .load(Ordering::Relaxed);
+        cell.released.wait();
+        tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap();
+        assert!(!cancelled_by_height);
+        assert!(cancelled_by_width);
+    }
+
+    #[tokio::test]
     async fn preparing_returns_before_render_and_discards_an_obsolete_width() {
         let cell = Arc::new(GatedCell {
             first: AtomicBool::new(true),
@@ -1359,7 +1501,7 @@ mod background_reflow_tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-            assert_eq!(result.prepared.unwrap().source, expected.lines);
+            assert_eq!(result.prepared.unwrap().source.as_ref(), &expected.lines);
         }
     }
 

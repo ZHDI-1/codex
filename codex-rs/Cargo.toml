@@ -535,7 +535,9 @@ tempfile = "3.23.0"
 test-log = "0.2.19"
 textwrap = "0.16.2"
 thiserror = "2.0.17"
-tikv-jemallocator = "=0.7.0"
+# Regex highlighting also allocates through C malloc/free. Keep those allocations on the same
+# scalable allocator as Rust in the static Linux musl binaries.
+tikv-jemallocator = { version = "=0.7.0", features = ["override_allocator_on_supported_platforms"] }
 time = "0.3.47"
 tiny_http = "0.12"
 tokio = "1"

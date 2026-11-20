@@ -89,7 +89,8 @@ codex-utils-sandbox-summary = { workspace = true }
 codex-utils-sleep-inhibitor = { workspace = true }
 codex-utils-string = { workspace = true }
 color-eyre = { workspace = true }
-crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
+# Level-triggered polling preserves unread input after partial reads and coalesced resize events.
+crossterm = { workspace = true, features = ["bracketed-paste", "event-stream", "use-dev-tty"] }
 derive_more = { workspace = true, features = ["debug", "is_variant"] }
 diffy = { workspace = true }
 dirs = { workspace = true }
